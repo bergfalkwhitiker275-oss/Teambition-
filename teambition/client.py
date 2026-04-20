@@ -41,6 +41,8 @@ class TeambitionClient:
         self._user_map: dict[str, str] = {}
         # 铉钉 userId -> Teambition memberId 映射缓存
         self._tb_member_map: dict[str, str] = {}
+        # 项目前缀缓存 (如 "BP3")
+        self._project_key: Optional[str] = None
 
     # ============================================================
     # 认证
@@ -184,6 +186,22 @@ class TeambitionClient:
             return resp.json()
 
     # ============================================================
+    # 项目信息
+    # ============================================================
+
+    async def get_project_key(self, operator_id: str = None, project_id: Optional[str] = None) -> str:
+        """获取项目前缀 (如 'BP3')，从配置文件读取"""
+        if self._project_key:
+            return self._project_key
+        key = self._settings.teambition_project_key
+        if key:
+            self._project_key = key
+            logger.info("项目前缀: %s", key)
+        else:
+            logger.warning("未配置 TEAMBITION_PROJECT_KEY，--tbid 将使用原始 taskId")
+        return key
+
+    # ============================================================
     # 项目成员相关
     # ============================================================
 
@@ -279,16 +297,17 @@ class TeambitionClient:
                 return name
         return user_id
 
-    @staticmethod
-    def format_submit_code(task_id: str, unique_id: int, title: str, executor_name: str) -> str:
+    def format_submit_code(self, task_id: str, unique_id: int, title: str, executor_name: str) -> str:
         """生成提交代码字符串，用于代码提交信息
 
-        格式: --tbid=MAD-44 --tbtitle=任务标题 --tburl=链接 --user=执行人
+        格式: --tbid=BP3-51 --tbtitle=任务标题 --tburl=链接 --user=执行人
         """
         task_url = f"https://www.teambition.com/task/{task_id}" if task_id else ""
         parts = []
-        if unique_id:
-            parts.append(f"--tbid=MAD-{unique_id}")
+        if unique_id and self._project_key:
+            parts.append(f"--tbid={self._project_key}-{unique_id}")
+        elif task_id:
+            parts.append(f"--tbid={task_id}")
         if title:
             parts.append(f"--tbtitle={title}")
         if task_url:

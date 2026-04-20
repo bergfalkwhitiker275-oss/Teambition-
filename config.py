@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     teambition_org_id: str = ""
     teambition_default_project_id: str = ""
     teambition_default_view_id: str = ""
+    teambition_project_key: str = ""
 
     # LLM 配置
     llm_api_key: str = ""

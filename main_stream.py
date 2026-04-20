@@ -288,6 +288,9 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
 
         tb = get_teambition_client()
 
+        # 预加载项目前缀（用于生成 BP3-51 格式的任务ID）
+        await tb.get_project_key(sender_id)
+
         # 解析负责人：未指定时默认为发送者自己
         assignee_id = None
         assignee_name = pr.assignee or sender_nick
@@ -572,6 +575,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
 
     async def _handle_query(self, pr, msg, sender_id, sender_nick):
         tb = get_teambition_client()
+        await tb.get_project_key(sender_id)
         query_target = pr.query_target
         query_status = pr.query_status
         query_sprint = getattr(pr, 'query_sprint', None)
