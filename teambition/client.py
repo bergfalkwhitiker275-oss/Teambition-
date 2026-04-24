@@ -382,6 +382,66 @@ class TeambitionClient:
         return None
 
     # ============================================================
+    # 任务类型 (场景字段配置)
+    # ============================================================
+
+    async def get_scenario_field_configs(
+        self, operator_id: str, project_id: Optional[str] = None,
+    ) -> list[dict]:
+        """
+        获取项目的任务类型列表 (场景字段配置)
+
+        API: GET https://open.teambition.com/api/v3/project/{projectId}/scenariofieldconfig/search
+        返回: [{"id": "xxx", "name": "需求", ...}, ...]
+        """
+        pid = project_id or self._settings.teambition_default_project_id
+        # 解析 Teambition userId 作为 x-operator-id
+        tb_user_id = await self.resolve_tb_member_id(operator_id)
+        op_id = tb_user_id or operator_id
+        try:
+            data = await self._tb_request(
+                "GET",
+                f"/v3/project/{pid}/scenariofieldconfig/search",
+                operator_id=op_id,
+            )
+            result = data.get("result", [])
+            if isinstance(result, dict):
+                result = result.get("scenariofieldconfigs", []) or result.get("result", [])
+            logger.info("项目任务类型: %s", [(r.get('name'), r.get('id') or r.get('scenariofieldconfigId') or r.get('_id')) for r in result])
+            return result
+        except Exception as e:
+            logger.error("获取任务类型列表失败: %s", e)
+            return []
+
+    async def resolve_scenario_field_config_id(
+        self, type_name: str, operator_id: str, project_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        根据任务类型名称查找 scenariofieldconfigId
+
+        Args:
+            type_name: 任务类型名称, 如 "需求"、"任务"、"缺陷"、"美术"
+        """
+        configs = await self.get_scenario_field_configs(operator_id, project_id)
+        # 精确匹配
+        for c in configs:
+            name = c.get("name", "")
+            config_id = c.get("id") or c.get("scenariofieldconfigId") or c.get("_id", "")
+            if name == type_name:
+                logger.info("匹配任务类型: '%s' -> %s", type_name, config_id)
+                return config_id
+        # 模糊匹配
+        for c in configs:
+            name = c.get("name", "")
+            config_id = c.get("id") or c.get("scenariofieldconfigId") or c.get("_id", "")
+            if type_name in name or name in type_name:
+                logger.info("模糊匹配任务类型: '%s' -> '%s' (%s)", type_name, name, config_id)
+                return config_id
+        available = [c.get('name') for c in configs]
+        logger.warning("未找到任务类型 '%s'，可用类型: %s", type_name, available)
+        return None
+
+    # ============================================================
     # 任务相关
     # ============================================================
 
@@ -394,6 +454,7 @@ class TeambitionClient:
         priority: Optional[int] = None,
         project_id: Optional[str] = None,
         note: Optional[str] = None,
+        scenario_field_config_id: Optional[str] = None,
     ) -> dict:
         """
         创建 Teambition 项目任务
@@ -406,6 +467,7 @@ class TeambitionClient:
             priority: 优先级 (0=普通, 1=紧急, 2=非常紧急)
             project_id: 项目 ID
             note: 备注
+            scenario_field_config_id: 任务类型 ID (场景字段配置 ID)
         """
         pid = project_id or self._settings.teambition_default_project_id
 
@@ -422,6 +484,8 @@ class TeambitionClient:
             payload["priority"] = priority
         if note:
             payload["note"] = note
+        if scenario_field_config_id:
+            payload["scenariofieldconfigId"] = scenario_field_config_id
 
         data = await self._request(
             "POST",
@@ -642,6 +706,31 @@ class TeambitionClient:
             json=payload,
         )
         logger.info("任务 %s 参与者已更新", task_id)
+        return data.get("result", data)
+
+    async def update_task_scenario_field_config(
+        self, task_id: str, operator_id: str, scenario_field_config_id: str,
+    ) -> dict:
+        """
+        更新任务的任务类型
+
+        API: PUT https://open.teambition.com/api/v3/task/{taskId}/sfc/update
+        Body: {"sfcId": "<目标任务类型ID>"}
+        参考: teambition/openapi-sdk-golang UpdateTaskSfcV3
+        """
+        tb_user_id = await self.resolve_tb_member_id(operator_id)
+        op_id = tb_user_id or operator_id
+        data = await self._tb_request(
+            "PUT",
+            f"/v3/task/{task_id}/sfc/update",
+            json={"sfcId": scenario_field_config_id},
+            operator_id=op_id,
+        )
+        error_code = data.get("errorCode", "") if isinstance(data, dict) else ""
+        if error_code:
+            error_msg = data.get("errorMessage", "")
+            raise RuntimeError(f"更新任务类型失败: {error_msg} (errorCode={error_code})")
+        logger.info("任务 %s 类型已更新为 %s", task_id, scenario_field_config_id)
         return data.get("result", data)
 
     # ============================================================

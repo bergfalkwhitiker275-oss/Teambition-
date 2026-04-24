@@ -44,6 +44,9 @@ HELP_TEXT = """### Teambition 任务管理机器人
 **创建任务:**
 - "给吕鑫下周五之前完成首页设计"
 - "创建一个紧急任务：修复登录Bug，负责人张三"
+- "创建一个需求《用户登录模块》给张三"
+- "提一个Bug：页面加载异常，负责人李四"
+- "给吕鑫创建美术任务：角色立绘"
 
 **修改任务:**
 - "把首页设计的优先级改为高"
@@ -51,6 +54,11 @@ HELP_TEXT = """### Teambition 任务管理机器人
 - "把首页设计的负责人改为庄健男"
 - "给首页设计添加备注：需要参考竞品"
 - "把吕鑫加为首页设计的参与者"
+- "把首页设计的类型改为缺陷"
+
+**批量修改类型:**
+- "将蔡宇航的工单类型都改为美术"
+- "把所有吕鑫的任务改为需求类型"
 
 **完成/重开任务:**
 - "把首页设计标记为完成"
@@ -248,12 +256,15 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
             action = parse_result.action
             handler_map = {
                 "create": self._handle_create,
+                "batch_create": self._handle_batch_create,
                 "update": self._handle_update,
+                "batch_update_type": self._handle_batch_update_type,
                 "complete": self._handle_complete,
                 "reopen": self._handle_reopen,
                 "delete": self._handle_delete,
                 "query": self._handle_query,
                 "status": self._handle_status,
+                "export_submit_code": self._handle_export_submit_code,
                 "help": self._handle_help,
             }
 
@@ -305,6 +316,18 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
 
         priority = PRIORITY_TO_INT.get(pr.priority or "medium", 0) if pr.priority else None
 
+        # 解析任务类型
+        scenario_field_config_id = None
+        task_type_name = pr.task_type or "任务"
+        try:
+            scenario_field_config_id = await tb.resolve_scenario_field_config_id(
+                task_type_name, operator_id=sender_id
+            )
+            if not scenario_field_config_id:
+                self.logger.warning("未找到任务类型'%s'，将使用默认类型创建", task_type_name)
+        except Exception as e:
+            self.logger.error("解析任务类型失败: %s", e)
+
         try:
             result = await tb.create_task(
                 title=pr.title,
@@ -313,6 +336,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                 due_date=pr.due_date,
                 priority=priority,
                 note=pr.note or f"由 {sender_nick} 通过钉钉机器人创建",
+                scenario_field_config_id=scenario_field_config_id,
             )
 
             # 如果有参与者，额外添加
@@ -348,6 +372,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
             md = [
                 "### 任务创建成功",
                 f"**任务:** {pr.title}",
+                f"**类型:** {task_type_name}",
                 f"**负责人:** {assignee_name}",
                 f"**截止日期:** {pr.due_date or '未设置'}",
                 f"**优先级:** {priority_text}",
@@ -388,6 +413,201 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
         except Exception as e:
             self.logger.exception("创建任务失败")
             self.reply_text(f"创建任务失败: {str(e)}", msg)
+
+    # ==============================================================
+    # 批量创建任务
+    # ==============================================================
+
+    async def _handle_batch_create(self, pr, msg, sender_id, sender_nick):
+        if not pr.is_valid_for_batch_create:
+            self.reply_text("请提供要创建的任务列表，例如：\n\"帮我提这几个单子：\nXXX\nYYY\nZZZ\"", msg)
+            return
+
+        tb = get_teambition_client()
+        await tb.get_project_key(sender_id)
+
+        # 预解析公共属性
+        common_sprint_id = None
+        common_sprint_name = pr.sprint
+        if pr.sprint:
+            common_sprint_id = await tb.resolve_sprint_id(pr.sprint, sender_id)
+            if not common_sprint_id:
+                self.logger.warning("未找到迭代 '%s'", pr.sprint)
+
+        common_assignee_id = sender_id
+        common_assignee_name = sender_nick
+        if pr.assignee:
+            uid = await tb.resolve_user_id(pr.assignee, operator_id=sender_id)
+            if uid:
+                common_assignee_id = uid
+                common_assignee_name = pr.assignee
+
+        common_type_name = pr.task_type or "任务"
+        common_sfc_id = None
+        try:
+            common_sfc_id = await tb.resolve_scenario_field_config_id(common_type_name, sender_id)
+        except Exception as e:
+            self.logger.error("解析公共任务类型失败: %s", e)
+
+        common_priority = PRIORITY_TO_INT.get(pr.priority or "medium", 0) if pr.priority else None
+
+        # 逐个创建任务，每条独立回复（格式与单独创建一致）
+        success_count = 0
+        fail_count = 0
+        for task_item in pr.tasks:
+            title = task_item.get("title", "")
+            if not title:
+                continue
+
+            # 独立属性覆盖公共属性
+            assignee_id = common_assignee_id
+            assignee_name = common_assignee_name
+            if task_item.get("assignee"):
+                uid = await tb.resolve_user_id(task_item["assignee"], operator_id=sender_id)
+                if uid:
+                    assignee_id = uid
+                    assignee_name = task_item["assignee"]
+
+            sfc_id = common_sfc_id
+            task_type_name = task_item.get("task_type") or common_type_name
+            if task_item.get("task_type") and task_item["task_type"] != common_type_name:
+                try:
+                    sfc_id = await tb.resolve_scenario_field_config_id(task_type_name, sender_id) or common_sfc_id
+                except Exception:
+                    pass
+
+            priority = common_priority
+            if task_item.get("priority"):
+                priority = PRIORITY_TO_INT.get(task_item["priority"], 0)
+
+            due_date = task_item.get("due_date") or pr.due_date
+            note = task_item.get("note") or pr.note or f"由 {sender_nick} 通过钉钉机器人批量创建"
+
+            try:
+                result = await tb.create_task(
+                    title=title,
+                    operator_id=sender_id,
+                    assignee_id=assignee_id,
+                    due_date=due_date,
+                    priority=priority,
+                    note=note,
+                    scenario_field_config_id=sfc_id,
+                )
+                task_id = result.get("taskId", "")
+
+                # 设置迭代
+                sprint_id = common_sprint_id
+                sprint_text = common_sprint_name or ""
+                if task_item.get("sprint"):
+                    sprint_id = await tb.resolve_sprint_id(task_item["sprint"], sender_id) or common_sprint_id
+                    sprint_text = task_item["sprint"] if sprint_id else sprint_text
+                if sprint_id and task_id:
+                    try:
+                        await tb.update_task_sprint(task_id, sender_id, sprint_id)
+                    except Exception as e:
+                        self.logger.error("批量创建设置迭代失败 %s: %s", title, e)
+
+                # --- 逐条回复，格式与单独创建一致 ---
+                priority_text = PRIORITY_TO_TEXT.get(priority, "普通") if priority else "普通"
+                md = [
+                    "### 任务创建成功",
+                    f"**任务:** {title}",
+                    f"**类型:** {task_type_name}",
+                    f"**负责人:** {assignee_name}",
+                    f"**截止日期:** {due_date or '未设置'}",
+                    f"**优先级:** {priority_text}",
+                ]
+                start_date = task_item.get("start_date") or pr.start_date
+                if start_date:
+                    md.append(f"**开始日期:** {start_date}")
+                if note and not note.startswith("由 "):
+                    md.append(f"**备注:** {note}")
+                if sprint_text:
+                    md.append(f"**迭代:** {sprint_text}")
+                link_md = self._task_link_md(task_id)
+                if link_md:
+                    md.append(f"\n🔗 {link_md}")
+
+                unique_id = result.get("uniqueId", 0)
+                submit_code = tb.format_submit_code(task_id, unique_id, title, assignee_name)
+                if submit_code:
+                    md.append(f"\n**提交代码:** ⬇️ 见下条消息，可右键直接复制")
+
+                self.reply_markdown("任务创建成功", "\n\n".join(md), msg)
+
+                if submit_code:
+                    self.reply_text(submit_code, msg)
+
+                # 通知项目管理员
+                if task_id:
+                    await self._notify_admins_new_task(
+                        tb, task_id, title, assignee_name, sender_nick, sender_id,
+                        sprint_text=sprint_text,
+                        due_date=due_date,
+                    )
+
+                success_count += 1
+                self.logger.info("批量创建任务成功: %s (taskId=%s)", title, task_id)
+            except Exception as e:
+                self.logger.error("批量创建任务失败 %s: %s", title, e)
+                fail_count += 1
+                self.reply_text(f"创建任务失败: {title}\n原因: {str(e)}", msg)
+
+        self.logger.info("批量创建任务: total=%d, success=%d, fail=%d",
+                         len(pr.tasks), success_count, fail_count)
+
+    # ==============================================================
+    # 导出迭代提交代码
+    # ==============================================================
+
+    async def _handle_export_submit_code(self, pr, msg, sender_id, sender_nick):
+        sprint_name = pr.sprint or pr.query_sprint
+        if not sprint_name:
+            self.reply_text("请指定迭代名称，例如：\n\"导出蚩梦觉醒迭代的提交代码\"", msg)
+            return
+
+        tb = get_teambition_client()
+        await tb.get_project_key(sender_id)
+
+        sprint_id = await tb.resolve_sprint_id(sprint_name, sender_id)
+        if not sprint_id:
+            self.reply_text(f"未找到迭代『{sprint_name}』，请检查迭代名称。", msg)
+            return
+
+        self.reply_text(f"正在导出迭代「{sprint_name}」的提交代码，请稍候...", msg)
+
+        tasks = await tb.query_tasks_by_sprint(sprint_id, sender_id)
+        if not tasks:
+            self.reply_text(f"迭代「{sprint_name}」下暂无任务。", msg)
+            return
+
+        # 确保成员缓存
+        if not tb._user_map:
+            await tb._load_project_members(sender_id)
+        executor_ids = [t.get("executorId", "") for t in tasks if t.get("executorId")]
+        if executor_ids:
+            await tb.ensure_user_names(executor_ids)
+
+        # 生成提交代码列表
+        lines = []
+        for t in tasks:
+            task_id = t.get("taskId", "")
+            unique_id = t.get("uniqueId", 0)
+            content = t.get("content", "")
+            executor_id = t.get("executorId", "")
+            executor_name = tb.resolve_user_name(executor_id) if executor_id else ""
+            code = tb.format_submit_code(task_id, unique_id, content, executor_name)
+            if code:
+                lines.append(code)
+
+        if not lines:
+            self.reply_text(f"迭代「{sprint_name}」下的任务暂无可导出的提交代码。", msg)
+            return
+
+        # 以纯文本发送，每行一条，方便用户一键复制
+        header = f"迭代「{sprint_name}」共 {len(lines)} 条提交代码：\n\n"
+        self.reply_text(header + "\n".join(lines), msg)
+        self.logger.info("导出提交代码: sprint=%s, count=%d", sprint_name, len(lines))
 
     # ==============================================================
     # 修改任务
@@ -475,6 +695,15 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                 else:
                     updated.append(f"**迭代:** 未找到『{sprint_name}』，跳过")
 
+            if "task_type" in fields:
+                type_name = fields["task_type"]
+                config_id = await tb.resolve_scenario_field_config_id(type_name, sender_id)
+                if config_id:
+                    await tb.update_task_scenario_field_config(task_id, sender_id, config_id)
+                    updated.append(f"**类型:** {type_name}")
+                else:
+                    updated.append(f"**类型:** 未找到『{type_name}』，跳过")
+
             if updated:
                 link_md = self._task_link_md(task_id)
                 link_line = f"\n\n🔗 {link_md}" if link_md else ""
@@ -488,6 +717,68 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
         except Exception as e:
             self.logger.exception("更新任务失败")
             self.reply_text(f"更新任务失败: {str(e)}", msg)
+
+    # ==============================================================
+    # 批量修改任务类型
+    # ==============================================================
+
+    async def _handle_batch_update_type(self, pr, msg, sender_id, sender_nick):
+        target_user = pr.batch_target_user
+        new_type = pr.batch_new_type
+
+        if not target_user:
+            self.reply_text("请告诉我要修改谁的任务类型，例如：\n\"将蔡宇航的工单类型都改为美术\"", msg)
+            return
+        if not new_type:
+            self.reply_text(f"请告诉我要把{target_user}的任务改为什么类型。\n支持: 需求/任务/缺陷/美术", msg)
+            return
+
+        tb = get_teambition_client()
+
+        # 解析目标用户
+        user_id = await tb.resolve_user_id(target_user, operator_id=sender_id)
+        if not user_id:
+            self.reply_text(f"未找到项目成员『{target_user}』。", msg)
+            return
+
+        # 解析目标任务类型
+        config_id = await tb.resolve_scenario_field_config_id(new_type, sender_id)
+        if not config_id:
+            self.reply_text(f"未找到任务类型『{new_type}』，请确认类型名称是否正确。", msg)
+            return
+
+        # 查询该用户的所有任务
+        tasks = await tb.query_user_tasks(sender_id, target_user_id=user_id, max_results=200)
+        if not tasks:
+            self.reply_text(f"{target_user}暂无任务。", msg)
+            return
+
+        # 批量更新
+        success_count = 0
+        fail_count = 0
+        for t in tasks:
+            task_id = t.get("taskId", "")
+            if not task_id:
+                continue
+            try:
+                await tb.update_task_scenario_field_config(task_id, sender_id, config_id)
+                success_count += 1
+            except Exception as e:
+                self.logger.error("批量更新任务类型失败 taskId=%s: %s", task_id, e)
+                fail_count += 1
+
+        md = [
+            "### 批量修改任务类型完成",
+            f"**目标用户:** {target_user}",
+            f"**新类型:** {new_type}",
+            f"**成功:** {success_count} 个",
+        ]
+        if fail_count:
+            md.append(f"**失败:** {fail_count} 个")
+
+        self.reply_markdown("批量修改完成", "\n\n".join(md), msg)
+        self.logger.info("批量更新任务类型: user=%s, type=%s, success=%d, fail=%d",
+                         target_user, new_type, success_count, fail_count)
 
     # ==============================================================
     # 完成任务

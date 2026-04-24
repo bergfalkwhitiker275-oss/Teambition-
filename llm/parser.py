@@ -26,6 +26,7 @@ class TaskParseResult:
         self.project: Optional[str] = data.get("project")
         self.note: Optional[str] = data.get("note")
         self.participants: Optional[list[str]] = data.get("participants")
+        self.task_type: Optional[str] = data.get("task_type")
         self.sprint: Optional[str] = data.get("sprint")
         self.target_task: Optional[str] = data.get("target_task")
         self.update_fields: Optional[dict] = data.get("update_fields")
@@ -34,12 +35,21 @@ class TaskParseResult:
         self.query_sprint: Optional[str] = data.get("query_sprint")
         self.notify: bool = bool(data.get("notify", False))
         self.status_name: Optional[str] = data.get("status_name")
+        self.batch_target_user: Optional[str] = data.get("batch_target_user")
+        self.batch_new_type: Optional[str] = data.get("batch_new_type")
+        self.tasks: Optional[list[dict]] = data.get("tasks")
         self.raw = data
 
     @property
     def is_valid_for_create(self) -> bool:
         """检查是否有足够信息创建任务 (至少需要标题)"""
         return bool(self.title)
+
+    @property
+    def is_valid_for_batch_create(self) -> bool:
+        """检查是否有足够信息批量创建任务"""
+        return bool(self.tasks and len(self.tasks) > 0
+                    and all(t.get("title") for t in self.tasks))
 
     @property
     def missing_fields(self) -> list[str]:
