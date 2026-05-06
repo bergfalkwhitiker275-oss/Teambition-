@@ -25,6 +25,8 @@ class TaskParseResult:
         self.priority: Optional[str] = data.get("priority")
         self.project: Optional[str] = data.get("project")
         self.note: Optional[str] = data.get("note")
+        self.requirement_source: Optional[str] = data.get("requirement_source")
+        self.acceptor: Optional[str] = data.get("acceptor")
         self.participants: Optional[list[str]] = data.get("participants")
         self.task_type: Optional[str] = data.get("task_type")
         self.sprint: Optional[str] = data.get("sprint")

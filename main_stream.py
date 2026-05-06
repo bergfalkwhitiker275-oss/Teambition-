@@ -14,8 +14,10 @@ Stream 模式通过 WebSocket 长连接接收钉钉消息，无需公网地址�
 import asyncio
 import json
 import logging
+import re
 import sys
 import threading
+import time
 
 import httpx
 import requests
@@ -77,6 +79,11 @@ HELP_TEXT = """### Teambition 任务管理机器人
 """
 
 
+# 用户级附件暂存：{sender_id: {"attachments": [...], "timestamp": float}}
+# 文件/图片消息无法与文字合并发送时，先暂存附件，等下一条文字指令自动关联
+PENDING_ATTACHMENTS_TTL = 300  # 暂存有效期 5 分钟
+
+
 class TaskBotHandler(dingtalk_stream.ChatbotHandler):
     """钉钉机器人消息处理器 - Stream 模式"""
 
@@ -84,6 +91,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
         super(dingtalk_stream.ChatbotHandler, self).__init__()
         if logger:
             self.logger = logger
+        self._pending_attachments: dict[str, dict] = {}  # 用户附件暂存区
 
     def reply_markdown_at(self, title: str, text: str, incoming_message, at_user_ids: list[str] = None):
         """发送 Markdown 回复并 @指定用户"""
@@ -234,20 +242,119 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
         """处理收到的钉钉消息"""
         try:
             incoming_message = dingtalk_stream.ChatbotMessage.from_dict(callback.data)
-            text = incoming_message.text.content.strip() if incoming_message.text else ""
             # sender_staff_id 是组织内真实 userId，sender_id 是加密格式不可用
             sender_id = incoming_message.sender_staff_id or incoming_message.sender_id
             sender_nick = incoming_message.sender_nick
             conversation_type = incoming_message.conversation_type
 
+            # 提取文本和附件（支持 text / richText / picture / file / video 消息类型）
+            text = ""
+            # attachment_infos: [{"download_code": ..., "file_name": ..., "file_type": ...}, ...]
+            attachment_infos = []
+            msg_type = incoming_message.message_type or ""
+            if msg_type == "richText":
+                text_parts = incoming_message.get_text_list() or []
+                text = "\n".join(text_parts).strip()
+                for code in (incoming_message.get_image_list() or []):
+                    attachment_infos.append({"download_code": code, "file_name": "image.png", "file_type": "image/png"})
+            elif msg_type == "picture":
+                for code in (incoming_message.get_image_list() or []):
+                    attachment_infos.append({"download_code": code, "file_name": "image.png", "file_type": "image/png"})
+            elif msg_type == "file":
+                # SDK 未原生解析 file 类型，数据在 extensions['content'] 中
+                file_content = incoming_message.extensions.get("content", {})
+                dl_code = file_content.get("downloadCode", "")
+                fname = file_content.get("fileName", "attachment")
+                if dl_code:
+                    # 根据文件扩展名推断 MIME 类型
+                    import mimetypes
+                    ftype = mimetypes.guess_type(fname)[0] or "application/octet-stream"
+                    attachment_infos.append({"download_code": dl_code, "file_name": fname, "file_type": ftype})
+            elif msg_type == "video":
+                video_content = incoming_message.extensions.get("content", {})
+                dl_code = video_content.get("downloadCode", "")
+                video_type = video_content.get("videoType", "mp4")
+                if dl_code:
+                    attachment_infos.append({"download_code": dl_code, "file_name": f"video.{video_type}", "file_type": f"video/{video_type}"})
+            if incoming_message.text:
+                text = incoming_message.text.content.strip()
+            elif msg_type in ("file", "video") and not text:
+                # 纯文件/视频消息无文本，从前一条或提示用户
+                pass
+
+            # 预处理: 清理钎钎 @提及格式，如 "@许乃轩(许乃轩)" -> "许乃轩"
+            text = re.sub(r'@([^@\(\)]+?)\(\1\)', r'\1', text)
+            # 处理 "@许乃轩" (无括号) -> "许乃轩"
+            text = re.sub(r'@([\u4e00-\u9fa5a-zA-Z0-9_]+)', r'\1', text)
+            text = text.strip()
+
+            # 预处理: 钎钎 SDK 会把 @提及的人名从 text.content 中剥离，
+            # 需要从 at_users 获取被 @的用户 staffId，查出姓名后重新注入文本
+            at_user_names = []
+            if incoming_message.at_users:
+                for at_user in incoming_message.at_users:
+                    staff_id = at_user.staff_id
+                    if not staff_id:
+                        continue  # 跳过机器人自身（无 staffId）
+                    if staff_id == sender_id:
+                        continue  # 跳过发送者自己
+                    try:
+                        tb = get_teambition_client()
+                        token = await tb._ensure_token()
+                        async with httpx.AsyncClient(timeout=10.0) as client:
+                            resp = await client.post(
+                                "https://oapi.dingtalk.com/topapi/v2/user/get",
+                                params={"access_token": token},
+                                json={"userid": staff_id},
+                            )
+                            data = resp.json()
+                            if data.get("errcode") == 0:
+                                name = data["result"].get("name", "")
+                                if name:
+                                    at_user_names.append(name)
+                            else:
+                                self.logger.warning("@用户解析失败 staffId=%s: %s", staff_id, data.get("errmsg"))
+                    except Exception as e:
+                        self.logger.warning("解析@用户名称失败 (staffId=%s): %s", staff_id, e)
+
+            if at_user_names:
+                names_str = "、".join(at_user_names)
+                # 把人名注入到文本中
+                if re.match(r'^\u7ed9\s', text):
+                    # "给  下一个单子" -> "给许乃轩、王雅菲下一个单子"
+                    text = re.sub(r'^\u7ed9\s+', f'给{names_str}', text)
+                else:
+                    text = f"[提及用户: {names_str}] {text}"
+                self.logger.info("注入@用户名称: %s, 处理后文本: %s", at_user_names, text)
+
             self.logger.info(
-                "收到消息: sender=%s (staffId=%s), type=%s, text=%s",
-                sender_nick, sender_id, conversation_type, text,
+                "收到消息: sender=%s (staffId=%s), type=%s, text=%s, attachments=%d",
+                sender_nick, sender_id, conversation_type, text, len(attachment_infos),
             )
 
             if not text:
-                self.reply_text("请发送任务相关指令，发送 \"帮助\" 查看支持的操作。", incoming_message)
+                if attachment_infos:
+                    # 暂存附件，等待后续文字指令
+                    existing = self._pending_attachments.get(sender_id, {}).get("attachments", [])
+                    existing.extend(attachment_infos)
+                    self._pending_attachments[sender_id] = {
+                        "attachments": existing,
+                        "timestamp": time.time(),
+                    }
+                    count = len(existing)
+                    self.reply_text(
+                        f"已暂存 {count} 个附件，请继续发送文字指令创建任务，附件将自动关联。\n（暂存有效期 5 分钟）",
+                        incoming_message,
+                    )
+                else:
+                    self.reply_text("请发送任务相关指令，发送 \"帮助\" 查看支持的操作。", incoming_message)
                 return AckMessage.STATUS_OK, "OK"
+
+            # 合并暂存的附件（有效期内）
+            pending = self._pending_attachments.pop(sender_id, None)
+            if pending and (time.time() - pending["timestamp"]) < PENDING_ATTACHMENTS_TTL:
+                attachment_infos = pending["attachments"] + attachment_infos
+                self.logger.info("合并暂存附件: %d 个 (来自用户 %s)", len(pending["attachments"]), sender_id)
 
             # 1. LLM 解析意图
             parse_result = await parse_task_from_message(text)
@@ -270,7 +377,8 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
 
             handler = handler_map.get(action)
             if handler:
-                await handler(parse_result, incoming_message, sender_id, sender_nick)
+                await handler(parse_result, incoming_message, sender_id, sender_nick,
+                              attachment_infos=attachment_infos)
             else:
                 self.reply_markdown("帮助", HELP_TEXT, incoming_message)
 
@@ -287,7 +395,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
     # 创建任务
     # ==============================================================
 
-    async def _handle_create(self, pr, msg, sender_id, sender_nick):
+    async def _handle_create(self, pr, msg, sender_id, sender_nick, attachment_infos=None):
         if not pr.is_valid_for_create:
             missing_msg = format_missing_info_message(pr)
             self.reply_text(missing_msg, msg)
@@ -308,7 +416,8 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
         if pr.assignee:
             assignee_id = await tb.resolve_user_id(pr.assignee, operator_id=sender_id)
             if not assignee_id:
-                self.reply_text(f"未找到项目成员「{pr.assignee}」，任务将创建但不指定负责人。", msg)
+                self.reply_text(f"❌ 创建工单失败：未找到项目成员「{pr.assignee}」，请确认姓名是否正确。", msg)
+                return
         else:
             # 未指定负责人，默认为发送者
             assignee_id = sender_id
@@ -318,7 +427,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
 
         # 解析任务类型
         scenario_field_config_id = None
-        task_type_name = pr.task_type or "任务"
+        task_type_name = pr.task_type or "需求"
         try:
             scenario_field_config_id = await tb.resolve_scenario_field_config_id(
                 task_type_name, operator_id=sender_id
@@ -368,7 +477,50 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                 else:
                     sprint_text = f"未找到『{pr.sprint}』"
 
+            # 如果有需求来源或验收人，设置自定义字段
+            requirement_source_text = ""
+            acceptor_text = ""
+            if task_id and (pr.requirement_source or pr.acceptor):
+                if pr.requirement_source:
+                    ok = await tb.set_task_custom_field_by_name(
+                        task_id, sender_id, "需求来源", pr.requirement_source
+                    )
+                    requirement_source_text = pr.requirement_source if ok else f"设置失败"
+                if pr.acceptor:
+                    ok = await tb.set_task_custom_field_by_name(
+                        task_id, sender_id, "验收人", pr.acceptor
+                    )
+                    acceptor_text = pr.acceptor if ok else f"设置失败"
+
             priority_text = PRIORITY_TO_TEXT.get(pr.priority, "普通") if pr.priority else "普通"
+
+            # 上传附件（如果用户发送了图片/文件/压缩包）
+            attachment_count = 0
+            if attachment_infos and task_id:
+                for idx, att in enumerate(attachment_infos):
+                    try:
+                        download_url = self.get_image_download_url(att["download_code"])
+                        if not download_url:
+                            self.logger.warning("获取附件下载链接失败: %s", att["file_name"])
+                            continue
+                        async with httpx.AsyncClient(timeout=60.0) as dl_client:
+                            dl_resp = await dl_client.get(download_url)
+                            dl_resp.raise_for_status()
+                            file_bytes = dl_resp.content
+                        # 使用原始文件名，多个同名文件加序号
+                        file_name = att["file_name"]
+                        if len(attachment_infos) > 1 and file_name == "image.png":
+                            ext = file_name.rsplit(".", 1)
+                            file_name = f"{ext[0]}_{idx + 1}.{ext[1]}" if len(ext) == 2 else f"{file_name}_{idx + 1}"
+                        content_type = dl_resp.headers.get("content-type", att["file_type"])
+                        await tb.upload_attachment_to_task(
+                            task_id, sender_id, file_name, file_bytes, content_type,
+                        )
+                        attachment_count += 1
+                        self.logger.info("附件上传成功: %s -> taskId=%s", file_name, task_id)
+                    except Exception as e:
+                        self.logger.error("附件上传失败 (%s): %s", att["file_name"], e)
+
             md = [
                 "### 任务创建成功",
                 f"**任务:** {pr.title}",
@@ -385,6 +537,12 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                 md.append(f"**参与者:** {', '.join(pr.participants)}")
             if sprint_text:
                 md.append(f"**迭代:** {sprint_text}")
+            if requirement_source_text:
+                md.append(f"**需求来源:** {requirement_source_text}")
+            if acceptor_text:
+                md.append(f"**验收人:** {acceptor_text}")
+            if attachment_count > 0:
+                md.append(f"**附件:** 已上传 {attachment_count} 个")
             link_md = self._task_link_md(task_id)
             if link_md:
                 md.append(f"\n🔗 {link_md}")
@@ -418,7 +576,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
     # 批量创建任务
     # ==============================================================
 
-    async def _handle_batch_create(self, pr, msg, sender_id, sender_nick):
+    async def _handle_batch_create(self, pr, msg, sender_id, sender_nick, attachment_infos=None):
         if not pr.is_valid_for_batch_create:
             self.reply_text("请提供要创建的任务列表，例如：\n\"帮我提这几个单子：\nXXX\nYYY\nZZZ\"", msg)
             return
@@ -442,7 +600,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                 common_assignee_id = uid
                 common_assignee_name = pr.assignee
 
-        common_type_name = pr.task_type or "任务"
+        common_type_name = pr.task_type or "需求"
         common_sfc_id = None
         try:
             common_sfc_id = await tb.resolve_scenario_field_config_id(common_type_name, sender_id)
@@ -467,6 +625,10 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                 if uid:
                     assignee_id = uid
                     assignee_name = task_item["assignee"]
+                else:
+                    self.reply_text(f"❌ 任务「{title}」创建失败：未找到项目成员「{task_item['assignee']}」。", msg)
+                    fail_count += 1
+                    continue
 
             sfc_id = common_sfc_id
             task_type_name = task_item.get("task_type") or common_type_name
@@ -495,6 +657,14 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                 )
                 task_id = result.get("taskId", "")
 
+                # 设置开始日期
+                start_date = task_item.get("start_date") or pr.start_date
+                if start_date and task_id:
+                    try:
+                        await tb.update_task_start_date(task_id, sender_id, start_date)
+                    except Exception as e:
+                        self.logger.error("批量创建设置开始日期失败 %s: %s", title, e)
+
                 # 设置迭代
                 sprint_id = common_sprint_id
                 sprint_text = common_sprint_name or ""
@@ -506,6 +676,45 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                         await tb.update_task_sprint(task_id, sender_id, sprint_id)
                     except Exception as e:
                         self.logger.error("批量创建设置迭代失败 %s: %s", title, e)
+
+                # 设置需求来源和验收人自定义字段
+                requirement_source_text = ""
+                acceptor_text = ""
+                if task_id and (pr.requirement_source or pr.acceptor):
+                    if pr.requirement_source:
+                        ok = await tb.set_task_custom_field_by_name(
+                            task_id, sender_id, "需求来源", pr.requirement_source
+                        )
+                        requirement_source_text = pr.requirement_source if ok else "设置失败"
+                    if pr.acceptor:
+                        ok = await tb.set_task_custom_field_by_name(
+                            task_id, sender_id, "验收人", pr.acceptor
+                        )
+                        acceptor_text = pr.acceptor if ok else "设置失败"
+
+                # 上传附件（如果用户发送了图片/文件/压缩包）
+                attachment_count = 0
+                if attachment_infos and task_id:
+                    for idx, att in enumerate(attachment_infos):
+                        try:
+                            download_url = self.get_image_download_url(att["download_code"])
+                            if not download_url:
+                                continue
+                            async with httpx.AsyncClient(timeout=60.0) as dl_client:
+                                dl_resp = await dl_client.get(download_url)
+                                dl_resp.raise_for_status()
+                                file_bytes = dl_resp.content
+                            file_name = att["file_name"]
+                            if len(attachment_infos) > 1 and file_name == "image.png":
+                                ext = file_name.rsplit(".", 1)
+                                file_name = f"{ext[0]}_{idx + 1}.{ext[1]}" if len(ext) == 2 else f"{file_name}_{idx + 1}"
+                            content_type = dl_resp.headers.get("content-type", att["file_type"])
+                            await tb.upload_attachment_to_task(
+                                task_id, sender_id, file_name, file_bytes, content_type,
+                            )
+                            attachment_count += 1
+                        except Exception as e:
+                            self.logger.error("批量创建附件上传失败 %s (%s): %s", title, att["file_name"], e)
 
                 # --- 逐条回复，格式与单独创建一致 ---
                 priority_text = PRIORITY_TO_TEXT.get(priority, "普通") if priority else "普通"
@@ -524,6 +733,12 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                     md.append(f"**备注:** {note}")
                 if sprint_text:
                     md.append(f"**迭代:** {sprint_text}")
+                if requirement_source_text:
+                    md.append(f"**需求来源:** {requirement_source_text}")
+                if acceptor_text:
+                    md.append(f"**验收人:** {acceptor_text}")
+                if attachment_count > 0:
+                    md.append(f"**附件:** 已上传 {attachment_count} 个")
                 link_md = self._task_link_md(task_id)
                 if link_md:
                     md.append(f"\n🔗 {link_md}")
@@ -560,7 +775,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
     # 导出迭代提交代码
     # ==============================================================
 
-    async def _handle_export_submit_code(self, pr, msg, sender_id, sender_nick):
+    async def _handle_export_submit_code(self, pr, msg, sender_id, sender_nick, **kwargs):
         sprint_name = pr.sprint or pr.query_sprint
         if not sprint_name:
             self.reply_text("请指定迭代名称，例如：\n\"导出蚩梦觉醒迭代的提交代码\"", msg)
@@ -613,7 +828,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
     # 修改任务
     # ==============================================================
 
-    async def _handle_update(self, pr, msg, sender_id, sender_nick):
+    async def _handle_update(self, pr, msg, sender_id, sender_nick, **kwargs):
         if not pr.target_task:
             self.reply_text("请告诉我要修改哪个任务，例如：\n\"把任务'首页设计'的优先级改为高\"", msg)
             return
@@ -722,7 +937,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
     # 批量修改任务类型
     # ==============================================================
 
-    async def _handle_batch_update_type(self, pr, msg, sender_id, sender_nick):
+    async def _handle_batch_update_type(self, pr, msg, sender_id, sender_nick, **kwargs):
         target_user = pr.batch_target_user
         new_type = pr.batch_new_type
 
@@ -784,7 +999,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
     # 完成任务
     # ==============================================================
 
-    async def _handle_complete(self, pr, msg, sender_id, sender_nick):
+    async def _handle_complete(self, pr, msg, sender_id, sender_nick, **kwargs):
         if not pr.target_task:
             self.reply_text("请告诉我要完成哪个任务，例如：\"把首页设计标记为完成\"", msg)
             return
@@ -811,7 +1026,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
     # 重新打开任务
     # ==============================================================
 
-    async def _handle_reopen(self, pr, msg, sender_id, sender_nick):
+    async def _handle_reopen(self, pr, msg, sender_id, sender_nick, **kwargs):
         if not pr.target_task:
             self.reply_text("请告诉我要重新打开哪个任务。", msg)
             return
@@ -837,12 +1052,20 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
     # 删除任务
     # ==============================================================
 
-    async def _handle_delete(self, pr, msg, sender_id, sender_nick):
+    async def _handle_delete(self, pr, msg, sender_id, sender_nick, **kwargs):
         if not pr.target_task:
             self.reply_text("请告诉我要删除哪个任务。", msg)
             return
 
         tb = get_teambition_client()
+
+        # 权限校验: 只有项目管理员才能删除工单
+        admin_ids = await tb.get_project_admins(sender_id)
+        if sender_id not in admin_ids:
+            self.reply_text("⚠️ 仅项目管理员可以删除工单，您没有删除权限。", msg)
+            self.logger.warning("非管理员尝试删除任务: sender=%s (%s)", sender_nick, sender_id)
+            return
+
         task = await tb.search_task_by_title(pr.target_task, operator_id=sender_id)
         if not task:
             self.reply_text(f"未找到任务『{pr.target_task}』。", msg)
@@ -855,7 +1078,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                 f"### 任务已删除\n\n**任务:** {task.get('content', pr.target_task)}",
                 msg,
             )
-            self.logger.info("任务已删除: %s", task["taskId"])
+            self.logger.info("任务已删除: %s (by admin %s)", task["taskId"], sender_nick)
         except Exception as e:
             self.logger.exception("删除任务失败")
             self.reply_text(f"删除任务失败: {str(e)}", msg)
@@ -864,7 +1087,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
     # 查询任务
     # ==============================================================
 
-    async def _handle_query(self, pr, msg, sender_id, sender_nick):
+    async def _handle_query(self, pr, msg, sender_id, sender_nick, **kwargs):
         tb = get_teambition_client()
         await tb.get_project_key(sender_id)
         query_target = pr.query_target
@@ -1143,7 +1366,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
     # 设置工作流状态
     # ==============================================================
 
-    async def _handle_status(self, pr, msg, sender_id, sender_nick):
+    async def _handle_status(self, pr, msg, sender_id, sender_nick, **kwargs):
         if not pr.target_task:
             self.reply_text("请告诉我要设置哪个任务的状态。", msg)
             return
@@ -1172,7 +1395,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
     # 帮助
     # ==============================================================
 
-    async def _handle_help(self, pr, msg, sender_id, sender_nick):
+    async def _handle_help(self, pr, msg, sender_id, sender_nick, **kwargs):
         self.reply_markdown("帮助", HELP_TEXT, msg)
 
 

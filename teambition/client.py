@@ -41,6 +41,8 @@ class TeambitionClient:
         self._user_map: dict[str, str] = {}
         # 铉钉 userId -> Teambition memberId 映射缓存
         self._tb_member_map: dict[str, str] = {}
+        # TB 原生用户 userId 集合（这些用户没有钉钉账号，创建任务时需特殊处理）
+        self._tb_native_users: set[str] = set()
         # 项目前缀缓存 (如 "BP3")
         self._project_key: Optional[str] = None
 
@@ -110,6 +112,7 @@ class TeambitionClient:
         dd_token = await self._ensure_token()
 
         # 优先尝试 JWT token，失败后回退到钉钉 token
+        last_error = None
         for token_type, token in [("jwt", tb_token), ("dingtalk", dd_token)]:
             headers = {
                 "Authorization": f"Bearer {token}",
@@ -131,9 +134,16 @@ class TeambitionClient:
                 data = resp.json() if resp.status_code < 500 else {}
                 code = data.get("code", 0) if isinstance(data, dict) else 0
 
-                # 认证失败(403)且还有备选 token，继续尝试
-                if (resp.status_code == 403 or code == 403) and token_type == "jwt":
-                    logger.warning("JWT token 认证失败，尝试钉钉 token...")
+                # 认证失败(401/403)且还有备选 token，继续尝试
+                if (resp.status_code in (401, 403) or code in (401, 403)) and token_type == "jwt":
+                    logger.warning(
+                        "JWT token 认证失败(%s %s), http=%d, code=%d, body=%s，尝试钉钉 token...",
+                        method, path, resp.status_code, code, resp.text[:500],
+                    )
+                    # 清除 JWT 缓存以便下次重新签发
+                    self._tb_access_token = None
+                    self._tb_token_expires_at = 0
+                    last_error = resp
                     continue
 
                 if resp.status_code >= 400:
@@ -245,6 +255,85 @@ class TeambitionClient:
         logger.info("项目管理员: %s (共 %d 人)", admin_ids, len(admin_ids))
         return admin_ids
 
+    async def _search_dd_user_by_name(self, name: str, mobile: str = "") -> Optional[str]:
+        """通过姓名或手机号在钉钉通讯录中查找用户的 userId
+
+        策略: 1) 先用手机号查找  2) 再遍历部门树按姓名匹配
+        """
+        try:
+            token = await self._ensure_token()
+
+            # 策略 1: 通过手机号查找
+            if mobile:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.post(
+                        f"{DINGTALK_OAPI_BASE}/topapi/v2/user/getbymobile",
+                        params={"access_token": token},
+                        json={"mobile": mobile},
+                    )
+                    data = resp.json()
+                    if data.get("errcode") == 0:
+                        dd_uid = data.get("result", {}).get("userid", "")
+                        if dd_uid:
+                            logger.info("钉钉通讯录按手机号找到: %s (%s) -> %s", name, mobile, dd_uid)
+                            return dd_uid
+                    else:
+                        logger.info("手机号查找失败(%s): %s", mobile, data.get("errmsg"))
+
+            # 策略 2: 遍历部门树按姓名匹配
+            # 递归获取所有部门 ID
+            dept_ids = [1]  # 从根部门开始
+            queue = [1]
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                while queue:
+                    parent_id = queue.pop(0)
+                    resp = await client.post(
+                        f"{DINGTALK_OAPI_BASE}/topapi/v2/department/listsub",
+                        params={"access_token": token},
+                        json={"dept_id": parent_id},
+                    )
+                    data = resp.json()
+                    if data.get("errcode") == 0:
+                        for d in data.get("result", []):
+                            did = d.get("dept_id")
+                            if did:
+                                dept_ids.append(did)
+                                queue.append(did)
+
+            logger.info("钉钉部门树: 共 %d 个部门", len(dept_ids))
+
+            # 遍历每个部门查找用户
+            all_names = []
+            for dept_id in dept_ids:
+                cursor = 0
+                while True:
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        resp = await client.post(
+                            f"{DINGTALK_OAPI_BASE}/topapi/v2/user/list",
+                            params={"access_token": token},
+                            json={"dept_id": dept_id, "cursor": cursor, "size": 100},
+                        )
+                        data = resp.json()
+                        if data.get("errcode") != 0:
+                            logger.warning("列出部门 %s 用户失败: %s", dept_id, data.get("errmsg"))
+                            break
+                        result = data.get("result", {})
+                        user_list = result.get("list", [])
+                        for user in user_list:
+                            uname = user.get("name", "")
+                            all_names.append(uname)
+                            if uname == name:
+                                dd_uid = user.get("userid", "")
+                                logger.info("钉钉通讯录按姓名找到: %s -> %s", name, dd_uid)
+                                return dd_uid
+                        if not result.get("has_more"):
+                            break
+                        cursor = result.get("next_cursor", 0)
+            logger.warning("钉钉通讯录未找到 '%s'，全部 %d 人: %s", name, len(all_names), all_names[:20])
+        except Exception as e:
+            logger.warning("钉钉通讯录按姓名搜索失败: %s", e)
+        return None
+
     async def get_user_detail(self, user_id: str) -> Optional[dict]:
         """
         通过钉钉通讯录 API 获取用户详情 (包含姓名)
@@ -272,23 +361,112 @@ class TeambitionClient:
         """
         加载项目成员并建立 姓名->userId 映射缓存
 
-        流程: 获取项目成员列表 -> 逐个查询用户姓名 -> 缓存
+        流程:
+        1. 先通过钉钉通讯录获取成员姓名（优先用钉钉 userId）
+        2. 对于钉钉通讯录查不到的用户（TB 原生用户），通过 TB 企业成员 API 补充
         """
+        # Step 1: 通过钉钉 API 获取项目成员列表
         members = await self.get_project_members(operator_id)
-        logger.info("项目成员数: %d", len(members))
+        logger.info("钉钉项目成员数: %d", len(members))
         if members:
             logger.info("成员示例字段: %s", members[0])
 
+        failed_uids = []
         for member in members:
             uid = member.get("userId", "")
-            if not uid or uid in [v for v in self._user_map.values()]:
+            if not uid or uid in self._user_map.values():
                 continue
             detail = await self.get_user_detail(uid)
             if detail:
                 name = detail.get("name", "")
-                if name:
+                if name and name not in self._user_map:
                     self._user_map[name] = uid
                     logger.info("缓存项目成员: %s -> %s", name, uid)
+                elif not name:
+                    failed_uids.append(uid)
+            else:
+                failed_uids.append(uid)
+
+        # Step 2: 对于钉钉通讯录查不到的用户，通过 TB 企业成员 API 补充
+        if failed_uids:
+            logger.warning("以下 %d 个成员无法通过钉钉通讯录查询姓名: %s", len(failed_uids), failed_uids)
+            await self._load_members_from_tb(operator_id, failed_uids)
+
+        logger.info("成员缓存加载完成，共 %d 人: %s", len(self._user_map), list(self._user_map.keys()))
+
+    async def _load_members_from_tb(self, operator_id: str, target_uids: list[str]) -> None:
+        """通过 Teambition 企业成员 API 获取带姓名的成员列表
+
+        从企业成员列表中查找 target_uids 对应的姓名。
+        这些用户是 TB 原生用户，其 userId 在钉钉通讯录中查不到。
+        使用 GET /org/member/list 获取企业成员（含姓名），
+        需要 tbs-app:appmember:list 权限（已开通）。
+        """
+        org_id = self._settings.teambition_org_id
+        if not org_id:
+            logger.warning("未配置 TEAMBITION_ORG_ID，跳过 TB 企业成员加载")
+            return
+
+        target_set = set(target_uids)
+        found_count = 0
+
+        try:
+            # 分页获取企业成员
+            page_token = ""
+            while target_set:
+                data = await self._tb_request(
+                    "GET",
+                    "/org/member/list",
+                    params={
+                        "orgId": org_id,
+                        "pageToken": page_token,
+                        "pageSize": 200,
+                        "filter": "enabled",
+                    },
+                )
+                result = data.get("result", []) if isinstance(data, dict) else []
+                if isinstance(result, dict):
+                    result = result.get("members", []) or result.get("result", []) or []
+                if not isinstance(result, list):
+                    result = []
+
+                logger.info("TB 企业成员 API 返回 %d 条记录", len(result))
+                if result:
+                    logger.info("TB 企业成员示例: %s", json.dumps(result[0], ensure_ascii=False, default=str)[:500])
+
+                for m in result:
+                    tb_uid = m.get("userId") or m.get("memberId") or ""
+                    if tb_uid not in target_set:
+                        continue
+                    name = m.get("name") or m.get("nickName") or m.get("nick") or ""
+                    if name:
+                        # 获取手机号和邮箱，用于在钉钉通讯录中查找
+                        mobile = m.get("phone", "") or ""
+                        logger.info("TB用户信息: %s, phone=%s, email=%s", name, mobile, m.get("email", ""))
+                        # 尝试通过姓名/手机号在钉钉通讯录中找到对应的钉钉 userId
+                        dd_uid = await self._search_dd_user_by_name(name, mobile=mobile)
+                        if dd_uid:
+                            self._user_map[name] = dd_uid
+                            logger.info("TB原生用户已映射到钉钉: %s -> DD:%s (TB:%s)", name, dd_uid, tb_uid)
+                        else:
+                            # 找不到钉钉 userId，使用 TB userId 并标记为 TB 原生用户
+                            self._user_map[name] = tb_uid
+                            self._tb_native_users.add(tb_uid)
+                            logger.warning("TB原生用户未找到钉钉账号: %s -> TB:%s", name, tb_uid)
+                        target_set.discard(tb_uid)
+                        found_count += 1
+
+                # 检查分页
+                next_token = data.get("nextPageToken", "") if isinstance(data, dict) else ""
+                if not next_token:
+                    break
+                page_token = next_token
+
+            if target_set:
+                logger.warning("仍有 %d 个成员未找到姓名: %s", len(target_set), target_set)
+            logger.info("TB 企业成员 API 补充了 %d 个成员", found_count)
+        except Exception as e:
+            logger.warning("TB 企业成员 API 查询失败: %s", e)
 
     def resolve_user_name(self, user_id: str) -> str:
         """根据 userId 反查姓名，未找到返回 userId 本身"""
@@ -364,8 +542,15 @@ class TeambitionClient:
         if name in self._user_map:
             return self._user_map[name]
 
-        # 加载项目成员
-        if not self._user_map and operator_id:
+        # 模糊匹配缓存
+        for cached_name, cached_id in self._user_map.items():
+            if name in cached_name or cached_name in name:
+                logger.info("模糊匹配用户: '%s' -> '%s' (%s)", name, cached_name, cached_id)
+                return cached_id
+
+        # 缓存未命中，尝试重新加载项目成员
+        if operator_id:
+            logger.info("缓存未找到 '%s'，重新加载项目成员...", name)
             await self._load_project_members(operator_id)
 
         # 精确匹配
@@ -378,7 +563,7 @@ class TeambitionClient:
                 logger.info("模糊匹配用户: '%s' -> '%s' (%s)", name, cached_name, cached_id)
                 return cached_id
 
-        logger.warning("未找到项目成员 '%s'", name)
+        logger.warning("未找到项目成员 '%s'，已缓存成员: %s", name, list(self._user_map.keys()))
         return None
 
     # ============================================================
@@ -476,8 +661,10 @@ class TeambitionClient:
             "content": title,
         }
 
-        if assignee_id:
+        if assignee_id and assignee_id not in self._tb_native_users:
             payload["executorId"] = assignee_id
+        # TB 原生用户不能通过钉钉 API 设置 executorId，需创建后通过 TB API 单独设置
+        tb_native_assignee = assignee_id if (assignee_id and assignee_id in self._tb_native_users) else None
         if due_date:
             payload["dueDate"] = due_date
         if priority is not None:
@@ -512,6 +699,23 @@ class TeambitionClient:
                     logger.warning("补查任务详情返回 None")
             except Exception as e:
                 logger.warning("补查 uniqueId 失败: %s", e)
+
+        # 对于 TB 原生用户，创建后通过 TB 开放平台 API 设置执行者
+        if task_id and tb_native_assignee:
+            try:
+                tb_op_id = await self.resolve_tb_member_id(operator_id)
+                op_id = tb_op_id or operator_id
+                resp_data = await self._tb_request(
+                    "PUT",
+                    f"/v3/task/{task_id}/executor",
+                    json={"executorId": tb_native_assignee},
+                    operator_id=op_id,
+                )
+                result["executorId"] = tb_native_assignee
+                logger.info("TB API 设置执行者成功: taskId=%s, executor=%s, resp=%s",
+                            task_id, tb_native_assignee, str(resp_data)[:200])
+            except Exception as e:
+                logger.error("TB API 设置执行者失败: %s", e)
 
         return result
 
@@ -734,6 +938,141 @@ class TeambitionClient:
         return data.get("result", data)
 
     # ============================================================
+    # 自定义字段 (Custom Fields)
+    # ============================================================
+
+    async def get_customfield_definitions(
+        self, operator_id: str, project_id: Optional[str] = None,
+    ) -> list[dict]:
+        """
+        获取项目的自定义字段定义列表
+
+        API: GET https://open.teambition.com/api/v3/project/{projectId}/customfield/search
+        返回: [{"_id": "xxx", "name": "需求来源", "type": "commongroup", "choices": [...], ...}]
+        """
+        pid = project_id or self._settings.teambition_default_project_id
+        tb_user_id = await self.resolve_tb_member_id(operator_id)
+        op_id = tb_user_id or operator_id
+        try:
+            data = await self._tb_request(
+                "GET",
+                f"/v3/project/{pid}/customfield/search",
+                operator_id=op_id,
+            )
+            result = data.get("result", [])
+            if isinstance(result, dict):
+                result = result.get("customfields", []) or result.get("result", []) or []
+            if result:
+                logger.info("自定义字段样例(第1个): %s", json.dumps(result[0], ensure_ascii=False, default=str)[:1000])
+            logger.info("项目自定义字段定义: %s", 
+                        [(cf.get('_id') or cf.get('id') or cf.get('cfId') or cf.get('customfieldId'), cf.get('name'), cf.get('type')) for cf in result])
+            return result
+        except Exception as e:
+            logger.error("获取项目自定义字段定义失败: %s", e)
+            return []
+
+    async def update_task_customfield_value(
+        self, task_id: str, operator_id: str, cf_id: str, value: list,
+    ) -> dict:
+        """
+        更新任务的单个自定义字段值
+
+        API: POST https://open.teambition.com/api/v3/task/{taskId}/customfield/update
+        Body: {"customfieldId": "xxx", "value": [{"id": "choiceId", "title": "显示名"}]}
+        参考: teambition/openapi-sdk-golang UpdateTaskCusomFieldV3
+        """
+        tb_user_id = await self.resolve_tb_member_id(operator_id)
+        op_id = tb_user_id or operator_id
+        data = await self._tb_request(
+            "POST",
+            f"/v3/task/{task_id}/customfield/update",
+            json={"customfieldId": cf_id, "value": value},
+            operator_id=op_id,
+        )
+        logger.info("任务 %s 自定义字段 %s 已更新: %s", task_id, cf_id, value)
+        return data.get("result", data)
+
+    async def set_task_custom_field_by_name(
+        self, task_id: str, operator_id: str,
+        field_name: str, field_value: str,
+    ) -> bool:
+        """
+        根据自定义字段名称和值来设置
+
+        流程:
+        1. 获取项目自定义字段定义 -> 找到字段 ID
+        2. 如果是选择类型，从 choices 中匹配 value
+        3. 如果是成员类型，解析用户 ID
+        4. 调用更新接口
+
+        Args:
+            field_name: 自定义字段名称, 如 "需求来源"
+            field_value: 字段值, 如 "其他" 或 人名
+        Returns:
+            是否设置成功
+        """
+        # Step 1: 获取项目自定义字段定义，找到名称匹配的字段
+        field_defs = await self.get_customfield_definitions(operator_id)
+        target_def = None
+        for fd in field_defs:
+            fd_name = fd.get("name", "")
+            if fd_name == field_name or field_name in fd_name or fd_name in field_name:
+                target_def = fd
+                logger.info("匹配自定义字段定义: '%s' -> %s (type=%s)", 
+                           field_name, fd.get('_id'), fd.get('type'))
+                break
+
+        if not target_def:
+            logger.warning("未找到自定义字段 '%s'，可用字段: %s", 
+                         field_name, [f.get('name') for f in field_defs])
+            return False
+
+        cf_id = target_def.get("_id") or target_def.get("id") or target_def.get("cfId") or target_def.get("customfieldId", "")
+        cf_type = target_def.get("type", "")
+        logger.info("自定义字段 '%s': cfId=%s, type=%s", field_name, cf_id, cf_type)
+
+        # Step 2: 根据字段类型构建值
+        cf_value = None
+        if cf_type in ("select", "commongroup", "dropDown"):
+            # 选择类型: 从 choices 中匹配
+            choices = target_def.get("choices", [])
+            for choice in choices:
+                choice_val = choice.get("value", "")
+                choice_id = choice.get("id") or choice.get("_id") or choice.get("choiceId", "")
+                if choice_val == field_value or field_value in choice_val or choice_val in field_value:
+                    # value 格式: [{"id": "choiceId", "title": "显示名"}]
+                    cf_value = [{"id": choice_id, "title": choice_val}]
+                    logger.info("匹配选项: '%s' -> %s (%s)", field_value, choice_val, choice_id)
+                    break
+            if not cf_value:
+                logger.warning("字段 '%s' 未找到选项 '%s'，可用选项: %s", 
+                             field_name, field_value, [(c.get('value'), c.get('id') or c.get('_id')) for c in choices])
+                return False
+        elif cf_type in ("member", "members", "lookup"):
+            # 成员类型: 解析用户 ID 并转换为 TB userId
+            user_id = await self.resolve_user_id(field_value, operator_id=operator_id)
+            if user_id:
+                tb_uid = await self.resolve_tb_member_id(user_id)
+                uid = tb_uid or user_id
+                # value 格式: [{"id": "tbUserId", "title": "姓名"}]
+                cf_value = [{"id": uid, "title": field_value}]
+            else:
+                logger.warning("自定义字段 '%s' 未找到用户 '%s'", field_name, field_value)
+                return False
+        else:
+            # 其他类型 (文本等): value 格式: [{"id": "", "title": "值"}]
+            cf_value = [{"id": "", "title": field_value}]
+
+        # Step 3: 更新
+        try:
+            await self.update_task_customfield_value(task_id, operator_id, cf_id, cf_value)
+            logger.info("自定义字段 '%s' 已设置为 '%s'", field_name, field_value)
+            return True
+        except Exception as e:
+            logger.error("设置自定义字段 '%s' 失败: %s", field_name, e)
+            return False
+
+    # ============================================================
     # 任务工作流/状态
     # ============================================================
 
@@ -802,6 +1141,120 @@ class TeambitionClient:
             error_msg = data.get("errorMessage", "")
             raise RuntimeError(f"迭代更新失败: {error_msg} (errorCode={error_code})")
         return data.get("result", data)
+
+    # ============================================================
+    # 附件上传
+    # ============================================================
+
+    async def upload_attachment_to_task(
+        self,
+        task_id: str,
+        operator_id: str,
+        file_name: str,
+        file_bytes: bytes,
+        file_type: str = "image/png",
+        project_id: Optional[str] = None,
+    ) -> dict:
+        """
+        上传附件到 Teambition 任务
+
+        流程:
+        1. POST /v3/awos/upload-token  → 获取上传凭证 + uploadUrl + token
+        2. PUT uploadUrl               → 上传文件字节
+        3. POST /v3/work/create         → 创建文件记录关联到项目
+
+        参考: teambition/openapi-sdk-golang FileAPI
+        """
+        pid = project_id or self._settings.teambition_default_project_id
+
+        # 将钉钉 userId 转为 Teambition userId（开放平台 API 需要 TB userId 作为 x-operator-id）
+        tb_operator_id = await self.resolve_tb_member_id(operator_id)
+        if not tb_operator_id:
+            raise RuntimeError(f"无法将钉钉 userId {operator_id} 转为 Teambition userId")
+
+        # Step 1: 获取上传凭证
+        token_data = await self._tb_request(
+            "POST",
+            "/v3/awos/upload-token",
+            json={
+                "scope": f"task:{task_id}",
+                "fileName": file_name,
+                "fileSize": len(file_bytes),
+                "fileType": file_type,
+                "category": "attachment",
+            },
+            operator_id=tb_operator_id,
+        )
+        result = token_data.get("result", token_data) if isinstance(token_data, dict) else {}
+        if isinstance(result, dict):
+            upload_url = result.get("uploadUrl", "")
+            file_token = result.get("token", "")
+        else:
+            upload_url = ""
+            file_token = ""
+
+        if not upload_url or not file_token:
+            raise RuntimeError(
+                f"获取上传凭证失败: uploadUrl={upload_url}, token={file_token}, "
+                f"response={token_data}"
+            )
+        logger.info("获取上传凭证成功: fileName=%s, token=%s...", file_name, file_token[:20])
+
+        # Step 2: PUT 上传文件字节到预签名 URL
+        # 注意：OSS 预签名 URL 的签名包含 Content-Type，不能随意设置
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            put_resp = await client.put(
+                upload_url,
+                content=file_bytes,
+            )
+            if put_resp.status_code >= 300:
+                raise RuntimeError(
+                    f"文件上传失败: status={put_resp.status_code}, "
+                    f"body={put_resp.text[:200]}"
+                )
+        logger.info("文件上传成功: %s (%d bytes)", file_name, len(file_bytes))
+
+        # Step 3: 创建文件记录
+        work_data = await self._tb_request(
+            "POST",
+            "/v3/work/create",
+            json={
+                "projectId": pid,
+                "fileTokens": [file_token],
+            },
+            operator_id=tb_operator_id,
+        )
+        work_result = work_data.get("result", work_data) if isinstance(work_data, dict) else {}
+        # work/create 返回的 result 可能是列表（每个 fileToken 一个 work）
+        work_id = None
+        if isinstance(work_result, list) and len(work_result) > 0:
+            work_id = work_result[0].get("id") or work_result[0].get("workId") or work_result[0].get("_id")
+        elif isinstance(work_result, dict):
+            work_id = work_result.get("id") or work_result.get("workId") or work_result.get("_id")
+        logger.info("文件记录创建成功: workId=%s, fileName=%s", work_id, file_name)
+
+        if not work_id:
+            logger.warning("无法获取 workId，跳过任务关联。work_data=%s", work_data)
+            return work_result
+
+        # Step 4: 将文件关联到任务（objectlink）
+        # linkedData 必须包含 url 字段
+        file_url = f"https://www.teambition.com/project/{pid}/works/{work_id}"
+        link_data = await self._tb_request(
+            "POST",
+            f"/v3/task/{task_id}/objectlinks",
+            json={
+                "linkedId": work_id,
+                "linkedType": "work",
+                "linkedData": {
+                    "title": file_name,
+                    "url": file_url,
+                },
+            },
+            operator_id=tb_operator_id,
+        )
+        logger.info("附件关联任务成功: taskId=%s, workId=%s, fileName=%s", task_id, work_id, file_name)
+        return link_data.get("result", link_data) if isinstance(link_data, dict) else link_data
 
     async def get_task_detail_tb(self, task_id: str, operator_id: Optional[str] = None) -> Optional[dict]:
         """通过铉钉 API 获取任务详情（含 sprintId）
