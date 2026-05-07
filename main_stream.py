@@ -14,6 +14,8 @@ Stream 模式通过 WebSocket 长连接接收钉钉消息，无需公网地址�
 import asyncio
 import json
 import logging
+import msvcrt
+import pathlib
 import re
 import sys
 import threading
@@ -26,7 +28,7 @@ from dingtalk_stream import AckMessage
 
 from config import get_settings
 from teambition.client import get_teambition_client
-from llm.parser import parse_task_from_message, format_missing_info_message
+from llm.parser import parse_task_from_message, format_missing_info_message, reset_to_primary, switch_to_fallback, is_using_fallback
 
 # 配置日志
 logging.basicConfig(
@@ -76,6 +78,10 @@ HELP_TEXT = """### Teambition 任务管理机器人
 - "查看我的任务"
 - "查看吕鑫的任务"
 - "查看任务首页设计的详情"
+
+**系统管理 (仅管理员):**
+- "恢复主模型" — 主模型配额恢复后，重置回主模型
+- "切换备用模型" — 手动切换到备用模型
 """
 
 
@@ -87,11 +93,26 @@ PENDING_ATTACHMENTS_TTL = 300  # 暂存有效期 5 分钟
 class TaskBotHandler(dingtalk_stream.ChatbotHandler):
     """钉钉机器人消息处理器 - Stream 模式"""
 
+    _MAP_FILE = pathlib.Path(__file__).parent / ".task_id_map.json"
+
     def __init__(self, logger: logging.Logger = None):
         super(dingtalk_stream.ChatbotHandler, self).__init__()
         if logger:
             self.logger = logger
-        self._pending_attachments: dict[str, dict] = {}  # 用户附件暂存区
+        self._pending_attachments: dict[str, dict] = {}
+        self._task_id_map: dict[str, str] = self._load_task_id_map()
+
+    def _load_task_id_map(self) -> dict:
+        try:
+            return json.loads(self._MAP_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _save_task_id_map(self) -> None:
+        try:
+            self._MAP_FILE.write_text(json.dumps(self._task_id_map), encoding="utf-8")
+        except Exception as e:
+            self.logger.warning("保存 task_id_map 失败: %s", e)
 
     def reply_markdown_at(self, title: str, text: str, incoming_message, at_user_ids: list[str] = None):
         """发送 Markdown 回复并 @指定用户"""
@@ -242,6 +263,8 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
         """处理收到的钉钉消息"""
         try:
             incoming_message = dingtalk_stream.ChatbotMessage.from_dict(callback.data)
+            # 临时: 打印原始 callback.data 以便分析引用消息结构
+            self.logger.debug("RAW callback.data: %s", callback.data)
             # sender_staff_id 是组织内真实 userId，sender_id 是加密格式不可用
             sender_id = incoming_message.sender_staff_id or incoming_message.sender_id
             sender_nick = incoming_message.sender_nick
@@ -278,6 +301,32 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                     attachment_infos.append({"download_code": dl_code, "file_name": f"video.{video_type}", "file_type": f"video/{video_type}"})
             if incoming_message.text:
                 text = incoming_message.text.content.strip()
+                # 引用消息处理: 把被引用消息的文本注入上下文
+                # 钉钉引用消息结构: text.isReplyMsg=True, text.repliedMsg.content.text = 被引用内容
+                replied_msg = incoming_message.text.extensions.get("repliedMsg")
+                if replied_msg and isinstance(replied_msg, dict):
+                    # 打印完整结构，用于分析钉钉引用消息的实际字段
+                    self.logger.info("repliedMsg 完整结构: %s", json.dumps(replied_msg, ensure_ascii=False))
+                    replied_content = replied_msg.get("content", {})
+                    if isinstance(replied_content, dict):
+                        replied_text = replied_content.get("text", "").strip()
+                    else:
+                        replied_text = str(replied_content).strip()
+                    if replied_text:
+                        id_match = re.search(r'任务创建成功\s+(\S+)', replied_text) or \
+                                   re.search(r'\*\*任务ID[:：]\*\*\s*(\S+)', replied_text)
+                        if id_match:
+                            task_label = id_match.group(1).strip()
+                            text = f"[引用任务ID: {task_label}] {text}"
+                            self.logger.info("引用消息提取任务ID: %s", task_label)
+                        else:
+                            task_match = re.search(r'\*\*任务[:：]\*\*\s*(.+)', replied_text)
+                            if task_match:
+                                text = f"[引用任务: {task_match.group(1).strip()}] {text}"
+                                self.logger.info("引用消息提取任务名: %s", task_match.group(1).strip())
+                            else:
+                                text = f"[引用消息: {replied_text[:200]}] {text}"
+                                self.logger.info("引用消息原文注入: %s", replied_text[:100])
             elif msg_type in ("file", "video") and not text:
                 # 纯文件/视频消息无文本，从前一条或提示用户
                 pass
@@ -356,6 +405,17 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                 attachment_infos = pending["attachments"] + attachment_infos
                 self.logger.info("合并暂存附件: %d 个 (来自用户 %s)", len(pending["attachments"]), sender_id)
 
+            # 系统管理命令不经过 LLM（LLM 不可用时也能执行）
+            _cmd = text.strip()
+            self.logger.info("命令匹配检查: repr=%r", _cmd)
+            if _cmd in ("恢复主模型", "切换主模型"):
+                await self._handle_reset_primary(None, incoming_message, sender_id, sender_nick)
+                return AckMessage.STATUS_OK, "OK"
+
+            if _cmd == "切换备用模型":
+                await self._handle_switch_fallback(None, incoming_message, sender_id, sender_nick)
+                return AckMessage.STATUS_OK, "OK"
+
             # 1. LLM 解析意图
             parse_result = await parse_task_from_message(text)
 
@@ -373,6 +433,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                 "status": self._handle_status,
                 "export_submit_code": self._handle_export_submit_code,
                 "help": self._handle_help,
+                "reset_primary": self._handle_reset_primary,
             }
 
             handler = handler_map.get(action)
@@ -466,11 +527,11 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
             # 如果有迭代
             sprint_text = ""
             if pr.sprint and task_id:
-                sprint_id = await tb.resolve_sprint_id(pr.sprint, sender_id)
+                sprint_id, sprint_actual = await tb.resolve_sprint_id(pr.sprint, sender_id)
                 if sprint_id:
                     try:
                         await tb.update_task_sprint(task_id, sender_id, sprint_id)
-                        sprint_text = pr.sprint
+                        sprint_text = sprint_actual
                     except Exception as e:
                         self.logger.error("创建任务时设置迭代失败: %s", e)
                         sprint_text = f"设置失败"
@@ -553,8 +614,8 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
             if submit_code:
                 md.append(f"\n**提交代码:** ⬇️ 见下条消息，可右键直接复制")
 
-            self.reply_markdown("任务创建成功", "\n\n".join(md), msg)
-            self.logger.info("任务创建成功: taskId=%s", task_id)
+            task_label = self._finalize_task_reply(md, tb, task_id, unique_id, msg)
+            self.logger.info("任务创建成功: taskId=%s uniqueId=%s label=%s", task_id, unique_id, task_label)
 
             # 单独发送提交代码文本，方便用户一键复制
             if submit_code:
@@ -588,7 +649,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
         common_sprint_id = None
         common_sprint_name = pr.sprint
         if pr.sprint:
-            common_sprint_id = await tb.resolve_sprint_id(pr.sprint, sender_id)
+            common_sprint_id, common_sprint_name = await tb.resolve_sprint_id(pr.sprint, sender_id)
             if not common_sprint_id:
                 self.logger.warning("未找到迭代 '%s'", pr.sprint)
 
@@ -669,8 +730,9 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                 sprint_id = common_sprint_id
                 sprint_text = common_sprint_name or ""
                 if task_item.get("sprint"):
-                    sprint_id = await tb.resolve_sprint_id(task_item["sprint"], sender_id) or common_sprint_id
-                    sprint_text = task_item["sprint"] if sprint_id else sprint_text
+                    item_sprint_id, item_sprint_name = await tb.resolve_sprint_id(task_item["sprint"], sender_id)
+                    sprint_id = item_sprint_id or common_sprint_id
+                    sprint_text = item_sprint_name if item_sprint_id else sprint_text
                 if sprint_id and task_id:
                     try:
                         await tb.update_task_sprint(task_id, sender_id, sprint_id)
@@ -748,7 +810,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                 if submit_code:
                     md.append(f"\n**提交代码:** ⬇️ 见下条消息，可右键直接复制")
 
-                self.reply_markdown("任务创建成功", "\n\n".join(md), msg)
+                self._finalize_task_reply(md, tb, task_id, unique_id, msg)
 
                 if submit_code:
                     self.reply_text(submit_code, msg)
@@ -784,16 +846,16 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
         tb = get_teambition_client()
         await tb.get_project_key(sender_id)
 
-        sprint_id = await tb.resolve_sprint_id(sprint_name, sender_id)
+        sprint_id, sprint_actual = await tb.resolve_sprint_id(sprint_name, sender_id)
         if not sprint_id:
             self.reply_text(f"未找到迭代『{sprint_name}』，请检查迭代名称。", msg)
             return
 
-        self.reply_text(f"正在导出迭代「{sprint_name}」的提交代码，请稍候...", msg)
+        self.reply_text(f"正在导出迭代「{sprint_actual}」的提交代码，请稍候...", msg)
 
         tasks = await tb.query_tasks_by_sprint(sprint_id, sender_id)
         if not tasks:
-            self.reply_text(f"迭代「{sprint_name}」下暂无任务。", msg)
+            self.reply_text(f"迭代「{sprint_actual}」下暂无任务。", msg)
             return
 
         # 确保成员缓存
@@ -816,13 +878,13 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                 lines.append(code)
 
         if not lines:
-            self.reply_text(f"迭代「{sprint_name}」下的任务暂无可导出的提交代码。", msg)
+            self.reply_text(f"迭代「{sprint_actual}」下的任务暂无可导出的提交代码。", msg)
             return
 
         # 以纯文本发送，每行一条，方便用户一键复制
-        header = f"迭代「{sprint_name}」共 {len(lines)} 条提交代码：\n\n"
+        header = f"迭代「{sprint_actual}」共 {len(lines)} 条提交代码：\n\n"
         self.reply_text(header + "\n".join(lines), msg)
-        self.logger.info("导出提交代码: sprint=%s, count=%d", sprint_name, len(lines))
+        self.logger.info("导出提交代码: sprint=%s, count=%d", sprint_actual, len(lines))
 
     # ==============================================================
     # 修改任务
@@ -837,7 +899,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
             return
 
         tb = get_teambition_client()
-        task = await tb.search_task_by_title(pr.target_task, operator_id=sender_id)
+        task = await tb.search_task_by_title(pr.target_task, operator_id=sender_id, task_id_map=self._task_id_map)
         if not task:
             self.reply_text(f"未找到任务『{pr.target_task}』，请确认任务名称是否正确。", msg)
             return
@@ -903,10 +965,10 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
 
             if "sprint" in fields:
                 sprint_name = fields["sprint"]
-                sprint_id = await tb.resolve_sprint_id(sprint_name, sender_id)
+                sprint_id, sprint_actual = await tb.resolve_sprint_id(sprint_name, sender_id)
                 if sprint_id:
                     await tb.update_task_sprint(task_id, sender_id, sprint_id)
-                    updated.append(f"**迭代:** {sprint_name}")
+                    updated.append(f"**迭代:** {sprint_actual}")
                 else:
                     updated.append(f"**迭代:** 未找到『{sprint_name}』，跳过")
 
@@ -1005,7 +1067,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
             return
 
         tb = get_teambition_client()
-        task = await tb.search_task_by_title(pr.target_task, operator_id=sender_id)
+        task = await tb.search_task_by_title(pr.target_task, operator_id=sender_id, task_id_map=self._task_id_map)
         if not task:
             self.reply_text(f"未找到任务『{pr.target_task}』。", msg)
             return
@@ -1032,7 +1094,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
             return
 
         tb = get_teambition_client()
-        task = await tb.search_task_by_title(pr.target_task, operator_id=sender_id)
+        task = await tb.search_task_by_title(pr.target_task, operator_id=sender_id, task_id_map=self._task_id_map)
         if not task:
             self.reply_text(f"未找到任务『{pr.target_task}』。", msg)
             return
@@ -1066,7 +1128,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
             self.logger.warning("非管理员尝试删除任务: sender=%s (%s)", sender_nick, sender_id)
             return
 
-        task = await tb.search_task_by_title(pr.target_task, operator_id=sender_id)
+        task = await tb.search_task_by_title(pr.target_task, operator_id=sender_id, task_id_map=self._task_id_map)
         if not task:
             self.reply_text(f"未找到任务『{pr.target_task}』。", msg)
             return
@@ -1099,8 +1161,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
             sprint_id = None
             sprint_name = None
             if query_sprint:
-                sprint_id = await tb.resolve_sprint_id(query_sprint, sender_id)
-                sprint_name = query_sprint
+                sprint_id, sprint_name = await tb.resolve_sprint_id(query_sprint, sender_id)
                 if not sprint_id:
                     self.reply_text(f"未找到迭代『{query_sprint}』。", msg)
                     return
@@ -1170,7 +1231,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                 title = f"{sender_nick} 的任务"
             elif pr.target_task:
                 # 查看特定任务详情
-                task = await tb.search_task_by_title(pr.target_task, operator_id=sender_id)
+                task = await tb.search_task_by_title(pr.target_task, operator_id=sender_id, task_id_map=self._task_id_map)
                 if task:
                     detail = await tb.get_task(task["taskId"], sender_id)
                     if not tb._user_map:
@@ -1375,7 +1436,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
             return
 
         tb = get_teambition_client()
-        task = await tb.search_task_by_title(pr.target_task, operator_id=sender_id)
+        task = await tb.search_task_by_title(pr.target_task, operator_id=sender_id, task_id_map=self._task_id_map)
         if not task:
             self.reply_text(f"未找到任务『{pr.target_task}』。", msg)
             return
@@ -1398,6 +1459,63 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
     async def _handle_help(self, pr, msg, sender_id, sender_nick, **kwargs):
         self.reply_markdown("帮助", HELP_TEXT, msg)
 
+    def _finalize_task_reply(self, md: list, tb, task_id: str, unique_id: int, msg) -> str:
+        """追加任务ID到回复正文并发送，返回 task_label（如 BP3-108）"""
+        project_key = tb._project_key or ""
+        task_label = f"{project_key}-{unique_id}" if (project_key and unique_id) else ""
+        if task_label:
+            md.append(f"\n**任务ID:** {task_label}")
+        reply_title = f"任务创建成功 {task_label}" if task_label else "任务创建成功"
+        self.reply_markdown(reply_title, "\n\n".join(md), msg)
+        if task_label:
+            self._task_id_map[task_label] = task_id
+            self._save_task_id_map()
+        return task_label
+
+    # ==============================================================
+    # 系统管理
+    # ==============================================================
+
+    async def _handle_reset_primary(self, pr, msg, sender_id, sender_nick, **kwargs):
+        """重置 LLM 为主模型（仅项目管理员可操作）"""
+        tb = get_teambition_client()
+        admin_ids = await tb.get_project_admins(sender_id)
+        if sender_id not in admin_ids:
+            self.reply_text("⚠️ 仅项目管理员可以重置 LLM 模型。", msg)
+            return
+        was_fallback = is_using_fallback()
+        reset_to_primary()
+        if was_fallback:
+            self.reply_text("✅ 已重置为主模型，下一条消息将使用主模型处理。", msg)
+            self.logger.info("管理员 %s (%s) 手动重置为主模型", sender_nick, sender_id)
+        else:
+            self.reply_text("当前已在使用主模型，无需重置。", msg)
+
+    async def _handle_switch_fallback(self, pr, msg, sender_id, sender_nick, **kwargs):
+        """手动切换到备用模型（仅项目管理员可操作）"""
+        tb = get_teambition_client()
+        admin_ids = await tb.get_project_admins(sender_id)
+        if sender_id not in admin_ids:
+            self.reply_text("⚠️ 仅项目管理员可以切换 LLM 模型。", msg)
+            return
+        settings = get_settings()
+        if not settings.llm_fallback_model:
+            self.reply_text("⚠️ 未配置备用模型（LLM_FALLBACK_MODEL），无法切换。", msg)
+            return
+        was_fallback = is_using_fallback()
+        switch_to_fallback()
+        if not was_fallback:
+            self.reply_text(
+                f"✅ 已切换到备用模型：{settings.llm_fallback_model}（{settings.llm_fallback_provider}）。\n"
+                "如需恢复，请发送：恢复主模型",
+                msg,
+            )
+            self.logger.info("管理员 %s (%s) 手动切换到备用模型", sender_nick, sender_id)
+        else:
+            self.reply_text(
+                f"当前已在使用备用模型：{settings.llm_fallback_model}，无需重复切换。", msg
+            )
+
 
 def start_fastapi_server():
     """在后台线程中启动 FastAPI (用于接收 Teambition Webhook)"""
@@ -1408,6 +1526,15 @@ def start_fastapi_server():
 
 
 def main():
+    # 单实例锁：防止多个进程同时运行
+    _lock_file = pathlib.Path(__file__).parent / ".bot.lock"
+    try:
+        _lock_fd = open(_lock_file, "w")
+        msvcrt.locking(_lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+    except (OSError, IOError):
+        print(f"[ERROR] 另一个实例正在运行，退出。(lock: {_lock_file})", flush=True)
+        sys.exit(1)
+
     settings = get_settings()
 
     if not settings.dingtalk_app_key or not settings.dingtalk_app_secret:

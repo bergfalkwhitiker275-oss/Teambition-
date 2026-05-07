@@ -740,13 +740,62 @@ class TeambitionClient:
             f"/v1.0/project/users/{operator_id}/projectIds/{pid}/tasks",
             params={"maxResults": max_results},
         )
-        return data.get("result", [])
+        result = data.get("result", [])
+        logger.info("query_project_tasks uid=%s pid=%s 返回 %d 个任务", operator_id, pid, len(result))
+        return result
+
+    async def get_task_by_unique_id(
+        self,
+        unique_id: int,
+        operator_id: str,
+        project_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """通过 uniqueId（如 BP3-108 中的 108）全项目搜索任务。
+
+        策略: 先用 query_project_tasks 快速匹配（列表API会返回 uniqueId 则命中），
+        若未找到则逐个调用 get_task_detail_tb 补查 uniqueId（历史任务）。
+        """
+        import asyncio
+        pid = project_id or self._settings.teambition_default_project_id
+
+        # 快速路径: 列表 API 返回 uniqueId 时可直接匹配
+        all_tasks = await self.query_project_tasks(operator_id, pid)
+        task = next((t for t in all_tasks if t.get("uniqueId") == unique_id), None)
+        if task:
+            logger.info("列表快速匹配 uniqueId=%d: taskId=%s", unique_id, task.get("taskId"))
+            return task
+
+        if not all_tasks:
+            logger.warning("项目无任务，无法定位 uniqueId=%d", unique_id)
+            return None
+
+        # 慢速路径: 逐个调用详情 API（列表 API 不含 uniqueId 时的历史任务回退）
+        logger.info("列表 API 未返回 uniqueId，逐个调用详情 API 定位 uniqueId=%d（共 %d 个任务）",
+                    unique_id, len(all_tasks))
+
+        async def _get_detail(t: dict):
+            tid = t.get("taskId", "")
+            if not tid:
+                return None
+            detail = await self.get_task_detail_tb(tid, operator_id)
+            if detail and detail.get("uniqueId") == unique_id:
+                return {**t, **detail}
+            return None
+
+        results = await asyncio.gather(*[_get_detail(t) for t in all_tasks])
+        task = next((r for r in results if r), None)
+        if task:
+            logger.info("详情补查命中 uniqueId=%d: taskId=%s", unique_id, task.get("taskId"))
+        else:
+            logger.warning("全量详情查询未找到 uniqueId=%d", unique_id)
+        return task
 
     async def search_task_by_title(
         self,
         title: str,
         operator_id: str,
         project_id: Optional[str] = None,
+        task_id_map: Optional[dict] = None,
     ) -> Optional[dict]:
         """
         通过标题搜索项目中的任务
@@ -754,8 +803,36 @@ class TeambitionClient:
         先拉取项目任务列表，然后按标题模糊匹配
         返回匹配度最高的任务，或 None
         """
+        import re as _re
+
+        # 如果 title 是 "BP3-104" 格式，优先从缓存里直接按 taskId 查
+        uid_match = _re.fullmatch(r'[A-Za-z0-9]+-(\d+)', title.strip())
+        if uid_match:
+            uid = int(uid_match.group(1))
+            # 1. 内存缓存（本次启动期间创建的任务）
+            if task_id_map:
+                cached_task_id = task_id_map.get(title.strip())
+                if cached_task_id:
+                    logger.info("从缓存命中任务ID: %s -> %s", title, cached_task_id)
+                    task = await self.get_task_detail_tb(cached_task_id, operator_id)
+                    if task:
+                        return task
+                    logger.warning("缓存命中但任务详情获取失败: %s", cached_task_id)
+            # 2. TB 全项目搜索（不受负责人限制）
+            task = await self.get_task_by_unique_id(uid, operator_id, project_id)
+            if task:
+                return task
+            # 3. 降级：在"我的任务"里按 uniqueId 匹配
+            tasks = await self.query_project_tasks(operator_id, project_id)
+            logger.info("降级搜索任务 '%s'，项目中共 %d 个任务", title, len(tasks))
+            for t in tasks:
+                if t.get("uniqueId") == uid:
+                    logger.info("降级匹配到任务ID: %s (id=%s)", title, t.get("taskId"))
+                    return t
+            logger.warning("未找到任务ID: '%s'", title)
+            return None
+
         tasks = await self.query_project_tasks(operator_id, project_id)
-        logger.info("搜索任务 '%s'，项目中共 %d 个任务", title, len(tasks))
 
         # 精确匹配
         for task in tasks:
@@ -1101,18 +1178,32 @@ class TeambitionClient:
 
     async def resolve_sprint_id(
         self, sprint_name: str, operator_id: str, project_id: Optional[str] = None,
-    ) -> Optional[str]:
+    ) -> tuple[Optional[str], str]:
+        """根据迭代名称查找迭代 ID，返回 (sprint_id, actual_name)。
+        actual_name 为 API 中的真实迭代名称；未找到时 sprint_id=None，actual_name=sprint_name。
         """
-        根据迭代名称查找迭代 ID
-        """
+        import re as _re
+
+        def _normalize(s: str) -> str:
+            return _re.sub(r"[\s\-_·•]", "", s).lower()
+
         sprints = await self.get_project_sprints(operator_id, project_id)
+        norm_input = _normalize(sprint_name)
+        # 第一轮：精确匹配或原始子串匹配
         for s in sprints:
             name = s.get("name", "")
             if name == sprint_name or sprint_name in name:
-                logger.info("匹配迭代: '%s' -> %s", sprint_name, s.get("sprintId"))
-                return s.get("sprintId", "")
+                logger.info("匹配迭代(精确): '%s' -> '%s' (%s)", sprint_name, name, s.get("sprintId"))
+                return s.get("sprintId", ""), name
+        # 第二轮：normalize 后子串匹配（忽略连字符/空格差异）
+        for s in sprints:
+            name = s.get("name", "")
+            norm_name = _normalize(name)
+            if norm_input in norm_name or norm_name in norm_input:
+                logger.info("匹配迭代(模糊): '%s' -> '%s' (%s)", sprint_name, name, s.get("sprintId"))
+                return s.get("sprintId", ""), name
         logger.warning("未找到迭代: '%s'", sprint_name)
-        return None
+        return None, sprint_name
 
     async def update_task_sprint(
         self, task_id: str, operator_id: str, sprint_id: str,

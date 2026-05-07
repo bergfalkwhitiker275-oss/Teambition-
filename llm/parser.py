@@ -1,16 +1,105 @@
 """LLM 意图解析模块 - 调用大模型提取任务信息"""
 
+import asyncio
 import json
 import logging
+import re
 from datetime import date
-from typing import Optional
+from typing import Optional, Union
 
+import anthropic
+import openai
+from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 
 from config import get_settings
 from llm.prompts import SYSTEM_PROMPT, PARSE_USER_MESSAGE, QUERY_STATUS_EXAMPLES
 
+import pathlib
+
 logger = logging.getLogger(__name__)
+
+# 备用模型状态持久化文件（进程重启后保持状态）
+_STATE_FILE = pathlib.Path(__file__).parent.parent / ".llm_fallback_state"
+
+def _load_fallback_state() -> bool:
+    try:
+        return _STATE_FILE.read_text().strip() == "1"
+    except Exception:
+        return False
+
+def _save_fallback_state(value: bool) -> None:
+    try:
+        _STATE_FILE.write_text("1" if value else "0")
+    except Exception as e:
+        logger.warning("无法保存 fallback 状态: %s", e)
+
+# 备用模型状态标志 — 主模型触发配额错误后切换，直到手动重置
+_using_fallback: bool = _load_fallback_state()
+
+
+def is_using_fallback() -> bool:
+    """返回当前是否正在使用备用模型"""
+    return _using_fallback
+
+
+def reset_to_primary() -> None:
+    """手动重置为主模型（由 '恢复主模型' 命令调用）"""
+    global _using_fallback
+    _using_fallback = False
+    _save_fallback_state(False)
+    logger.info("已手动重置为主模型")
+
+
+def switch_to_fallback() -> None:
+    """手动切换到备用模型（由 '切换备用模型' 命令调用）"""
+    global _using_fallback
+    _using_fallback = True
+    _save_fallback_state(True)
+    logger.info("已手动切换到备用模型")
+
+
+async def _notify_admins_fallback_switch() -> None:
+    """切换到备用模型后，通过钉钉私信通知项目管理员（fire-and-forget）"""
+    try:
+        import httpx
+        import json as _json
+        from teambition.client import get_teambition_client
+        settings = get_settings()
+        if not settings.llm_fallback_model:
+            return
+        tb = get_teambition_client()
+        admin_ids = await tb.get_project_admins(operator_id="")
+        if not admin_ids:
+            logger.warning("备用模型切换通知：未找到项目管理员，跳过通知")
+            return
+        token = await tb._ensure_token()
+        notify_md = (
+            "### ⚠️ LLM 主模型配额耗尽\n\n"
+            f"机器人已自动切换到备用模型：**{settings.llm_fallback_model}**\n\n"
+            "如需恢复主模型，请发送：**恢复主模型**"
+        )
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend",
+                headers={
+                    "x-acs-dingtalk-access-token": token,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "robotCode": settings.dingtalk_app_key,
+                    "userIds": admin_ids,
+                    "msgKey": "sampleMarkdown",
+                    "msgParam": _json.dumps({
+                        "title": "LLM 主模型配额耗尽，已切换备用模型",
+                        "text": notify_md,
+                    }),
+                },
+            )
+            resp.raise_for_status()
+        logger.info("已向 %d 个管理员发送备用模型切换通知", len(admin_ids))
+    except Exception as e:
+        logger.error("发送备用模型切换通知失败: %s", e)
 
 
 class TaskParseResult:
@@ -74,30 +163,51 @@ class TaskParseResult:
         }
 
 
-async def parse_task_from_message(message: str) -> TaskParseResult:
+async def parse_task_from_message(message: str) -> "TaskParseResult":
     """
-    使用 LLM 从自然语言消息中提取任务信息
+    使用 LLM 从自然语言消息中提取任务信息。
 
-    Args:
-        message: 用户发送的消息文本
-
-    Returns:
-        TaskParseResult: 解析结果
+    主模型配额耗尽（RateLimitError / AuthenticationError）时自动切换到备用模型，
+    并持久保持该状态直到手动调用 reset_to_primary()。
+    备用模型支持 OpenAI 兼容接口和 Anthropic 原生接口（通过 LLM_FALLBACK_PROVIDER 区分）。
     """
+    global _using_fallback
     settings = get_settings()
 
-    client = AsyncOpenAI(
-        api_key=settings.llm_api_key,
-        base_url=settings.llm_base_url,
-    )
+    def _active_model(use_fallback: bool) -> str:
+        return settings.llm_fallback_model if use_fallback else settings.llm_model
+
+    def _parse_json(content: str) -> dict:
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            match = re.search(r'\{.*\}', content, re.DOTALL)
+            if match:
+                return json.loads(match.group())
+            logger.error("LLM 返回内容无法解析为 JSON: %s", content)
+            return {}
 
     current_date = date.today().isoformat()
-    system_prompt = SYSTEM_PROMPT.format(current_date=current_date) + QUERY_STATUS_EXAMPLES.format(current_date=current_date)
+    system_prompt = (
+        SYSTEM_PROMPT.format(current_date=current_date)
+        + QUERY_STATUS_EXAMPLES.format(current_date=current_date)
+    )
     user_prompt = PARSE_USER_MESSAGE.format(message=message)
 
-    try:
+    async def _call_openai(use_fallback: bool) -> "TaskParseResult":
+        if use_fallback:
+            client = AsyncOpenAI(
+                api_key=settings.llm_fallback_api_key,
+                base_url=settings.llm_fallback_base_url or None,
+            )
+        else:
+            client = AsyncOpenAI(
+                api_key=settings.llm_api_key,
+                base_url=settings.llm_base_url,
+            )
+        model = _active_model(use_fallback)
         response = await client.chat.completions.create(
-            model=settings.llm_model,
+            model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -105,24 +215,55 @@ async def parse_task_from_message(message: str) -> TaskParseResult:
             temperature=0.1,
             response_format={"type": "json_object"},
         )
-
         content = response.choices[0].message.content or "{}"
-
-        # 尝试解析 JSON
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
-            # 尝试从回复中提取 JSON 部分
-            import re
-            json_match = re.search(r'\{[^{}]*\}', content, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
-            else:
-                logger.error("LLM 返回内容无法解析为 JSON: %s", content)
-                data = {}
-
-        logger.info("LLM 解析结果: %s", json.dumps(data, ensure_ascii=False))
+        data = _parse_json(content)
+        logger.info("LLM 解析结果 (openai model=%s): %s", model, json.dumps(data, ensure_ascii=False))
         return TaskParseResult(data)
+
+    async def _call_anthropic() -> "TaskParseResult":
+        client = AsyncAnthropic(
+            api_key=settings.llm_fallback_api_key,
+            base_url=settings.llm_fallback_base_url or None,
+        )
+        model = settings.llm_fallback_model
+        response = await client.messages.create(
+            model=model,
+            max_tokens=1024,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+            temperature=0.1,
+        )
+        text_blocks = [b for b in response.content if b.type == "text"]
+        content = text_blocks[0].text if text_blocks else "{}"
+        data = _parse_json(content)
+        logger.info("LLM 解析结果 (anthropic model=%s): %s", model, json.dumps(data, ensure_ascii=False))
+        return TaskParseResult(data)
+
+    async def _call_fallback() -> "TaskParseResult":
+        if settings.llm_fallback_provider.lower() == "anthropic":
+            return await _call_anthropic()
+        return await _call_openai(True)
+
+    try:
+        return await _call_openai(_using_fallback) if not _using_fallback else await _call_fallback()
+
+    except (openai.RateLimitError, openai.AuthenticationError) as quota_err:
+        if not _using_fallback:
+            logger.warning("主模型配额耗尽 (%s)，切换到备用模型", type(quota_err).__name__)
+            if not settings.llm_fallback_model:
+                logger.warning("未配置备用模型 (LLM_FALLBACK_MODEL)，无法切换")
+                return TaskParseResult({})
+            _using_fallback = True
+            _save_fallback_state(True)
+            asyncio.create_task(_notify_admins_fallback_switch())
+            try:
+                return await _call_fallback()
+            except Exception as fallback_err:
+                logger.error("备用模型调用也失败: %s", fallback_err)
+                return TaskParseResult({})
+        else:
+            logger.error("备用模型配额也耗尽: %s", quota_err)
+            return TaskParseResult({})
 
     except Exception as e:
         logger.error("LLM 调用失败: %s", str(e))

@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "gpt-4o-mini"
 
+    # LLM 备用模型配置 (主模型配额耗尽时自动切换)
+    llm_fallback_api_key: str = ""
+    llm_fallback_base_url: str = ""
+    llm_fallback_model: str = ""
+    llm_fallback_provider: str = "openai"  # "openai" 或 "anthropic"
+
 
 @lru_cache
 def get_settings() -> Settings:
