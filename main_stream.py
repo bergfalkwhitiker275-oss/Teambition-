@@ -909,35 +909,52 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
         fields = pr.update_fields
         updated = []
 
+        # 如果需要更新迭代，先取当前任务详情以获取 sprintId
+        task_detail = None
+        if "sprint" in fields:
+            task_detail = await tb.get_task_detail_tb(task_id, sender_id)
+
+        # 如果需要显示旧负责人姓名，确保缓存中有该用户
+        if "assignee" in fields and task.get("executorId"):
+            await tb.ensure_user_names([task["executorId"]])
+
         try:
             if "priority" in fields:
-                val = PRIORITY_TO_INT.get(fields["priority"], 0)
-                await tb.update_task_priority(task_id, sender_id, val)
-                updated.append(f"**优先级:** {PRIORITY_TO_TEXT.get(fields['priority'], fields['priority'])}")
+                old_val = INT_TO_PRIORITY_TEXT.get(task.get("priority", 0), "普通")
+                new_val = PRIORITY_TO_TEXT.get(fields["priority"], fields["priority"])
+                await tb.update_task_priority(task_id, sender_id, PRIORITY_TO_INT.get(fields["priority"], 0))
+                updated.append(f"**优先级:** {old_val} → {new_val}")
 
             if "assignee" in fields:
                 uid = await tb.resolve_user_id(fields["assignee"], operator_id=sender_id)
                 if uid:
+                    old_name = tb.resolve_user_name(task.get("executorId", "")) or "未指定"
                     await tb.update_task_executor(task_id, sender_id, uid)
-                    updated.append(f"**负责人:** {fields['assignee']}")
+                    updated.append(f"**负责人:** {old_name} → {fields['assignee']}")
                 else:
                     updated.append(f"**负责人:** 未找到『{fields['assignee']}』，跳过")
 
             if "due_date" in fields:
+                old_val = (task.get("dueDate") or "")[:10] or "未设置"
+                new_val = fields["due_date"][:10]
                 await tb.update_task_due_date(task_id, sender_id, fields["due_date"])
-                updated.append(f"**截止日期:** {fields['due_date']}")
+                updated.append(f"**截止日期:** {old_val} → {new_val}")
 
             if "start_date" in fields:
+                old_val = (task.get("startDate") or "")[:10] or "未设置"
+                new_val = fields["start_date"][:10]
                 await tb.update_task_start_date(task_id, sender_id, fields["start_date"])
-                updated.append(f"**开始日期:** {fields['start_date']}")
+                updated.append(f"**开始日期:** {old_val} → {new_val}")
 
             if "title" in fields:
+                old_val = task.get("content", "")
                 await tb.update_task_content(task_id, sender_id, fields["title"])
-                updated.append(f"**新标题:** {fields['title']}")
+                updated.append(f"**标题:** {old_val} → {fields['title']}")
 
             if "note" in fields:
+                old_val = task.get("note") or "无"
                 await tb.update_task_note(task_id, sender_id, fields["note"])
-                updated.append(f"**备注:** {fields['note']}")
+                updated.append(f"**备注:** {old_val} → {fields['note']}")
 
             if "add_participants" in fields:
                 add_ids = []
@@ -967,8 +984,10 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                 sprint_name = fields["sprint"]
                 sprint_id, sprint_actual = await tb.resolve_sprint_id(sprint_name, sender_id)
                 if sprint_id:
+                    old_sprint_id = (task_detail or {}).get("sprintId", "")
+                    old_sprint_name = await tb.resolve_sprint_name_by_id(old_sprint_id, sender_id) if old_sprint_id else "无"
                     await tb.update_task_sprint(task_id, sender_id, sprint_id)
-                    updated.append(f"**迭代:** {sprint_actual}")
+                    updated.append(f"**迭代:** {old_sprint_name} → {sprint_actual}")
                 else:
                     updated.append(f"**迭代:** 未找到『{sprint_name}』，跳过")
 
@@ -977,7 +996,7 @@ class TaskBotHandler(dingtalk_stream.ChatbotHandler):
                 config_id = await tb.resolve_scenario_field_config_id(type_name, sender_id)
                 if config_id:
                     await tb.update_task_scenario_field_config(task_id, sender_id, config_id)
-                    updated.append(f"**类型:** {type_name}")
+                    updated.append(f"**类型:** → {type_name}")
                 else:
                     updated.append(f"**类型:** 未找到『{type_name}』，跳过")
 

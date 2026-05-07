@@ -1205,6 +1205,18 @@ class TeambitionClient:
         logger.warning("未找到迭代: '%s'", sprint_name)
         return None, sprint_name
 
+    async def resolve_sprint_name_by_id(
+        self, sprint_id: str, operator_id: str, project_id: Optional[str] = None,
+    ) -> str:
+        """根据 sprintId 返回迭代名称，未找到时返回空字符串"""
+        if not sprint_id:
+            return ""
+        sprints = await self.get_project_sprints(operator_id, project_id)
+        for s in sprints:
+            if s.get("sprintId") == sprint_id:
+                return s.get("name", "")
+        return ""
+
     async def update_task_sprint(
         self, task_id: str, operator_id: str, sprint_id: str,
     ) -> dict:
