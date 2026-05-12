@@ -1183,9 +1183,13 @@ class TeambitionClient:
         actual_name 为 API 中的真实迭代名称；未找到时 sprint_id=None，actual_name=sprint_name。
         """
         import re as _re
+        from difflib import SequenceMatcher
 
         def _normalize(s: str) -> str:
             return _re.sub(r"[\s\-_·•]", "", s).lower()
+
+        def _similarity(a: str, b: str) -> float:
+            return SequenceMatcher(None, a, b).ratio()
 
         sprints = await self.get_project_sprints(operator_id, project_id)
         norm_input = _normalize(sprint_name)
@@ -1202,6 +1206,20 @@ class TeambitionClient:
             if norm_input in norm_name or norm_name in norm_input:
                 logger.info("匹配迭代(模糊): '%s' -> '%s' (%s)", sprint_name, name, s.get("sprintId"))
                 return s.get("sprintId", ""), name
+        # 第三轮：相似度匹配（应对 LLM 幻觉导致的个别字符错误）
+        best_match = None
+        best_score = 0.0
+        for s in sprints:
+            name = s.get("name", "")
+            norm_name = _normalize(name)
+            score = max(_similarity(norm_input, norm_name), _similarity(sprint_name, name))
+            if score > best_score:
+                best_score = score
+                best_match = s
+        if best_match and best_score >= 0.6:
+            name = best_match.get("name", "")
+            logger.info("匹配迭代(相似度=%.2f): '%s' -> '%s' (%s)", best_score, sprint_name, name, best_match.get("sprintId"))
+            return best_match.get("sprintId", ""), name
         logger.warning("未找到迭代: '%s'", sprint_name)
         return None, sprint_name
 
